@@ -133,6 +133,8 @@ Detailed list of changes
   :ac:`resize_window` action and :code:`kitten @ resize-window`, see :ref:`docks`
   (:iss:`10857`)
 
+- Unicode input kitten: Fix searching by name not finding some characters such as the pound sign (:iss:`10862`)
+
 - :doc:`Custom shaders <custom-shaders>`: Add ``screen-shake`` shaders that shake
   a window on bell and new events and uniforms for command start/finish and
   alternate screen enter/exit
@@ -141,6 +143,11 @@ Detailed list of changes
   closed, a new ``on_cwd_change`` event fires when the working directory changes
   and ``on_resize``/``on_focus_change`` calls are no longer dropped when many
   windows are created at once (:disc:`10828`, :iss:`10853`)
+
+- Allow running the programs in new windows via a wrapper command, such as to
+  open new windows inside the same container as the window they are opened
+  from, using a :file:`launch_wrapper.py` file in the kitty config directory,
+  see :ref:`launch_wrapper` (:iss:`10858`)
 
 - Sessions: Fix tabs and windows moved with :ac:`detach_tab`,
   :ac:`detach_window` or drag and drop losing their session. :ac:`save_as_session`
@@ -216,6 +223,9 @@ Detailed list of changes
 - Treat the ConEmu OSC 9;9 escape code as a report of the current working
   directory, like OSC 7, and ignore other ConEmu OSC 9 numeric sub-commands
   instead of showing them as desktop notifications
+
+- Fix an error instead of a helpful message when the configured :opt:`editor`
+  is not found while editing the config file (:iss:`10865`)
 
 
 0.50.0 [2026-11-03]
