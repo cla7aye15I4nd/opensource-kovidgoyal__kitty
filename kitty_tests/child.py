@@ -6,13 +6,14 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 from contextlib import suppress
 from select import select
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from kitty.child import Child, KittyWrapper, children_of_process, cmdline_of_pid, cwd_of_process, memory_used_by_process_tree_rooted_at
-from kitty.constants import is_macos, kitty_exe
+from kitty.constants import is_macos, kitten_exe, kitty_exe
 
 from .base import BaseTest
 
@@ -389,6 +390,23 @@ class LaunchWrapperTest(BaseTest):
             with suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
 
+    def _assert_root_pid_settles(self, c: Child, expected: int, timeout: float = 5) -> None:
+        # Reading the process tree from /proc is not atomic, so on a heavily
+        # loaded machine root_pid can transiently fail to resolve all the way
+        # down to the command. Such results are never cached, so wait for it
+        # to settle, while a wrong result that is cached still fails.
+        end_time = time.monotonic() + timeout
+        while (actual := c.root_pid) != expected and time.monotonic() < end_time:
+            time.sleep(0.01)
+        if actual != expected:
+            tree = {}
+            for pid in [c.pid] + _descendants(c.pid):
+                try:
+                    tree[pid] = cmdline_of_pid(pid), children_of_process(pid)
+                except Exception as err:
+                    tree[pid] = err
+            self.fail(f'root_pid: {actual} != {expected} wrappers: {c.kitty_wrappers} resolved: {c.resolved_root_pid} process tree: {tree}')
+
     def _send_line(self, p: subprocess.Popen) -> None:
         p.stdin.write(b'\n')
         p.stdin.flush()
@@ -479,7 +497,11 @@ read -r _
             c.pid = p.pid
             try:
                 command_pid = int(self._read_line(p))
-                self.ae(c.root_pid, command_pid)
+                if cmdline_of_pid(command_pid)[0] != command[0]:
+                    # Under emulation, such as qemu-user via binfmt_misc, the
+                    # cmdline of processes starts with the emulator
+                    self.skipTest('Running under emulation')
+                self._assert_root_pid_settles(c, command_pid)
             finally:
                 self._stop_tree(p)
 
@@ -534,3 +556,37 @@ read -r _
                 c, exe, argv = self._fork(launch_request=req, user_func=self._recording(empty))
                 self.ae(argv, ('/bin/prog', 'arg'))
         self.ae(len(errors), 4)
+
+    def test_launch_wrapper_invalid_shell(self):
+        # An invalid shell option falls back to the login shell, with the
+        # wrapper still applied
+        from kitty import utils
+        from kitty.constants import shell_path
+        from kitty.launch_wrapper import LaunchRequest
+
+        opts = self.set_options({'shell': '"unterminated', 'shell_integration': frozenset({'disabled'})})
+        req = LaunchRequest('tab')
+        utils.report_invalid_shell.cache_clear()
+        with patch.object(utils, 'log_error') as log_error:
+            self.ae(utils.resolved_shell(opts), [shell_path])
+            c, exe, argv = self._fork(launch_request=req, user_func=self._recording(['/bin/wrapper']))
+            self.ae(argv, ('/bin/wrapper', '/bin/prog', 'arg'))
+            self.ae(c.kitty_wrappers, (KittyWrapper(('/bin/wrapper',), True, ('/bin/prog', 'arg')),))
+            self.assertFalse(self.contexts[-1].is_default_shell)
+            c, exe, argv = self._fork(argv=(shell_path,), launch_request=req, user_func=self._recording(['/bin/wrapper']))
+            if is_macos:
+                # On macOS the default shell is run via /usr/bin/login and the
+                # run-shell kitten, with the wrapper inside login
+                login_argv = c.kitty_wrappers[0].argv
+                self.ae(login_argv[0], '/usr/bin/login')
+                self.ae(argv[: len(login_argv)], login_argv)
+                rest = argv[len(login_argv) :]
+                self.ae(rest[:3], ('/bin/wrapper', kitten_exe(), 'run-shell'))
+                self.ae(rest[3:5], ('--shell', shell_path))
+            else:
+                self.ae(argv, ('/bin/wrapper', shell_path))
+            self.assertTrue(self.contexts[-1].is_default_shell)
+        utils.report_invalid_shell.cache_clear()
+        # Reported only once
+        log_error.assert_called_once()
+        self.assertIn('Unterminated string', log_error.call_args.args[0])
