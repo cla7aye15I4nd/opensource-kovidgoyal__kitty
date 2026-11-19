@@ -131,6 +131,14 @@ Detailed list of changes
 
 - Fix animated images stopping when switching to a tab without animations and then back (:iss:`10894`)
 
+- Linux: Fix variable fonts that use axis values to substitute glyphs, such as the cursive axis of Annotation Mono, not rendering the substituted glyphs (:iss:`10897`)
+
+- Fix a single window with :opt:`draw_window_borders_for_single_window` having no border, and with :opt:`window_border_radius` being hidden by an extra layer of background, when its margin is narrower than its border. Space for the border is now reserved between the margin and the window contents (:iss:`10899`)
+
+- Fix the :ref:`launch wrapper <launch_wrapper>` not being used for programs run in an already running panel or quick access terminal in single instance mode (:pull:`10900`)
+
+- panel kitten: In single instance mode, run the command in a new panel in the working directory it was invoked from and do not pass internal environment variables such as :code:`XDG_ACTIVATION_TOKEN` to commands run in panels, as for other single instance commands
+
 0.51.0 [2026-11-18]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
