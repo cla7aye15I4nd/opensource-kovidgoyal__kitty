@@ -3,18 +3,22 @@
 
 import os
 from functools import lru_cache
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from .constants import config_dir
 from .fast_data_types import (
     DECAWM,
     Screen,
+    get_boss,
     get_options,
 )
 from .rgb import color_as_sgr, color_from_int, to_color
 from .tab_bar import draw_attributed_string, safe_builtins
 from .types import WindowGeometry, run_once
 from .utils import color_as_int, log_error
+
+if TYPE_CHECKING:
+    from .window import Window
 
 
 @lru_cache
@@ -86,6 +90,34 @@ class WindowTitleData(NamedTuple):
     tab_id: int
     needs_attention: bool = False
     has_activity_since_last_focus: bool = False
+
+
+class WindowAccessor:
+    def __init__(self, window_id: int):
+        self.id = window_id
+
+    def __str__(self) -> str:
+        return str(self.id)
+
+    @property
+    def _window(self) -> 'Window | None':
+        boss = get_boss()
+        return boss.window_id_map.get(self.id) if boss is not None else None
+
+    @property
+    def wd(self) -> str:
+        w = self._window
+        return (w.get_cwd_of_child() if w else '') or ''
+
+    @property
+    def columns(self) -> int:
+        w = self._window
+        return w.screen.columns if w else 0
+
+    @property
+    def lines(self) -> int:
+        w = self._window
+        return w.screen.lines if w else 0
 
 
 @run_once
@@ -170,6 +202,7 @@ class WindowTitleBarScreen:
             'activity_symbol': activity_symbol,
             'progress_percent': progress_percent,
             'custom': custom_result or '',
+            'window': WindowAccessor(data.window_id),
         }
         try:
             title = eval(_compile_template(template), {'__builtins__': safe_builtins}, eval_locals)
