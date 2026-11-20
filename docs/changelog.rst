@@ -127,6 +127,8 @@ Detailed list of changes
 
 - dnd kitten: Fix a malicious remote drop source being able to write files outside the staging directory by sending a directory with the same name as a previously sent symlink (follow up to :cve:`2026-54056`)
 
+- File transfer protocol: Refuse to write files via a symlink created earlier in the same transfer, preventing a malicious sender from redirecting files outside the destination directory through intermediate path components (follow up to :cve:`2026-54055`)
+
 - Fix a crash when calling :code:`Screen.hyperlink_at()` with coordinates outside the screen, such as from a watcher (:iss:`10890`)
 
 - Fix animated images stopping when switching to a tab without animations and then back (:iss:`10894`)
@@ -138,6 +140,10 @@ Detailed list of changes
 - Fix the :ref:`launch wrapper <launch_wrapper>` not being used for programs run in an already running panel or quick access terminal in single instance mode (:pull:`10900`)
 
 - panel kitten: In single instance mode, run the command in a new panel in the working directory it was invoked from and do not pass internal environment variables such as :code:`XDG_ACTIVATION_TOKEN` to commands run in panels, as for other single instance commands
+
+- :ref:`Launch wrapper <launch_wrapper>`: Allow the wrapper to keep windows created with :option:`launch --hold` open itself, so that the shell runs inside the wrapper, via a new ``hold`` field in ``LaunchContext`` and a new ``LaunchPrefix`` return type (:iss:`10901`)
+
+- Fix the text in window title bars being drawn with the old cell size after changing the font size or moving a window to an OS window with a different font size (:pull:`10903`)
 
 0.51.0 [2026-11-18]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
