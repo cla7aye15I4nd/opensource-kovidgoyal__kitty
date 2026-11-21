@@ -131,6 +131,10 @@ Detailed list of changes
 
 - File transfer protocol: Refuse to write files via a symlink created earlier in the same transfer, preventing a malicious sender from redirecting files outside the destination directory through intermediate path components (follow up to :cve:`2026-54055`)
 
+- Remove the limit on the number of simultaneously active timers, which could cause scheduled actions, such as watcher calls, to fail with a "Too many timers added" error when many were pending at once
+
+- Linux: Fix a crash when a timer, such as one scheduled by a watcher or kitten, is removed by another timer that fires at the same time
+
 - Fix a crash when calling :code:`Screen.hyperlink_at()` with coordinates outside the screen, such as from a watcher (:iss:`10890`)
 
 - Fix animated images stopping when switching to a tab without animations and then back (:iss:`10894`)
@@ -152,6 +156,8 @@ Detailed list of changes
 - Window drag and drop: In layouts that can only reorder windows, such as Tall and Grid, the whole window being dropped onto is highlighted and the dropped window takes its place, instead of highlighting a half that did not match where the window ended up. In the Splits layout, dropping onto the side of a window that the dragged window is already on swaps them instead of doing nothing (:pull:`10908`)
 
 - Preserve non-ASCII hyperlink IDs and URLs when exporting terminal text with ANSI formatting. Also replace invalid UTF-8 in hyperlinks with U+FFFD and control characters with their graphical alternatives, and do not split multi-byte characters when truncating very long hyperlinks, which could cause errors when clicking them (:pull:`10909`)
+
+- macOS: Fix multiple font files sharing the same PostScript name causing incorrect variant to be loaded sometimes (:iss:`10906`)
 
 0.51.0 [2026-11-18]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
