@@ -125,6 +125,8 @@ Detailed list of changes
 0.51.1 [future]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+- Docks: Fix docks changing size when switching tabs or opening and closing windows when :opt:`single_window_margin_width` or :opt:`single_window_padding_width` is set. A tab with docks no longer counts as showing a single window
+
 - Saving sessions: Fix programs running in a window being able to inject arbitrary commands into saved session files via line breaks in the working directory reported with OSC 7 or in user variables. Arguments with line breaks in :code:`launch` lines are now written using ANSI-C (:code:`$'...'`) quoting
 
 - dnd kitten: Fix a malicious remote drop source being able to write files outside the staging directory by sending a directory with the same name as a previously sent symlink (follow up to :cve:`2026-54056`)
@@ -158,6 +160,10 @@ Detailed list of changes
 - Preserve non-ASCII hyperlink IDs and URLs when exporting terminal text with ANSI formatting. Also replace invalid UTF-8 in hyperlinks with U+FFFD and control characters with their graphical alternatives, and do not split multi-byte characters when truncating very long hyperlinks, which could cause errors when clicking them (:pull:`10909`)
 
 - macOS: Fix multiple font files sharing the same PostScript name causing incorrect variant to be loaded sometimes (:iss:`10906`)
+
+- A new :ac:`clear_bell_indicators` action to clear the bell indicators of all windows, or windows matching an expression, without needing to focus them (:iss:`10916`)
+
+- :ac:`combine`: Fix the third and subsequent actions in a mouse mapping not being run for the window that was clicked. Also fix an error when a mapping refers to an action name that matches a non-action attribute of the window or tab
 
 - :doc:`launch <launch>`: Run the program as requested instead of resolving it to a full path first, so that wrappers such as the :ref:`launch wrapper <launch_wrapper>` look it up in their own :envvar:`PATH` and the program sees itself invoked by name, as when run from a shell. Programs that would not be found in :envvar:`PATH`, such as ones found via :opt:`exe_search_path`, are still run via their full path (:iss:`10914`)
 
