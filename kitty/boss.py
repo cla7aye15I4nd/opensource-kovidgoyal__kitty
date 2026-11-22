@@ -87,6 +87,7 @@ from .fast_data_types import (
     add_timer,
     apply_options_update,
     background_opacity_of,
+    cancel_bell_attention,
     change_background_opacity,
     change_drag_thumbnail,
     cocoa_hide_app,
@@ -1209,6 +1210,8 @@ class Boss:
             if tab is not None:
                 tab.remove_window(window)
                 self._cleanup_tab_after_window_removal(tab)
+            if window.needs_attention:
+                self.cancel_bell_attention_if_idle((os_window_id,))
             for removal_action in window.actions_on_removal:
                 try:
                     removal_action(window)
@@ -4366,12 +4369,18 @@ class Boss:
         and :opt:`bell_on_tab`, without needing to focus the windows that rang
         the bell. By default, clears them for all windows. Optionally, specify
         an expression to only clear them for matching windows. See
-        :ref:`search_syntax` for details on the match expression. For example::
+        :ref:`search_syntax` for details on the match expression.
+
+        The system attention request from :opt:`window_alert_on_bell` is
+        dismissed once all bell indicators in its OS window have been cleared.
+        Not supported on Wayland, where such requests cannot be withdrawn.
+
+        For example::
 
             # Clear bell indicators in all windows
             map f1 clear_bell_indicators
             # Clear bell indicators only in the windows of the currently active tab
-            map f2 clear_bell_indicators state:parent_active
+            map f2 clear_bell_indicators state:parent_focused
             # Clear bell indicators only in the windows of the focused OS window
             map f3 clear_bell_indicators state:focused_os_window
         """,
@@ -4387,6 +4396,13 @@ class Boss:
             windows = list(self.all_windows)
         for w in windows:
             w.clear_needs_attention()
+        self.cancel_bell_attention_if_idle({w.os_window_id for w in windows})
+
+    def cancel_bell_attention_if_idle(self, os_window_ids: Iterable[int]) -> None:
+        """Cancel the system attention request of the specified OS windows, if none of their windows need attention"""
+        pending = {w.os_window_id for w in self.all_windows if w.needs_attention}
+        for os_window_id in set(os_window_ids) - pending:
+            cancel_bell_attention(os_window_id)
 
     def update_progress_in_dock(self) -> None:
         if not is_macos:
