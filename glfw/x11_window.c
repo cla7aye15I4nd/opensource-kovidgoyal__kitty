@@ -68,6 +68,8 @@ x11_scroll_stop_timer_callback(unsigned long long timer_id UNUSED, void *data UN
         x11_momentum_scroll_state.last_event.unscaled.x = 0;
         x11_momentum_scroll_state.last_event.unscaled.y = 0;
         x11_momentum_scroll_state.last_event.phase = GLFW_SCROLL_PHASE_ENDED;
+        // The gesture ended when its last event happened, not when this timer
+        // fired, so the end keeps the time of the last event
         glfw_handle_scroll_event_for_momentum(w, &x11_momentum_scroll_state.last_event, true, true);
     } else {
         // Window no longer exists, cancel any ongoing momentum
@@ -99,6 +101,7 @@ x11_cancel_scroll_gesture(void) {
         ev.unscaled.x = 0;
         ev.unscaled.y = 0;
         ev.phase = GLFW_SCROLL_PHASE_CANCELLED;
+        ev.timestamp = monotonic();
         _glfwInputScroll(w, &ev);
     }
 }
@@ -1456,6 +1459,42 @@ number_has_fractional_part(double x) {
     return fabs(x - round(x)) >= 1e-6;
 }
 
+static bool
+is_multiple_of_v120_unit(double x) {
+    return fabs(x * 120 - round(x * 120)) < 0.01;
+}
+
+// XWayland exposes a single pointer device for all Wayland scroll sources and
+// reports deltas in units of the scroll increment. Wheel events are the
+// value120 of the Wayland event divided by 120, while continuous (touchpad)
+// events are the scroll distance in pixels divided by
+// XWAYLAND_PIXELS_PER_SCROLL_INCREMENT. Since a wheel and a touchpad can be used
+// alternately, the type has to be detected for every event, rather than once per
+// device. The offsets are passed in units of the scroll increment and are
+// converted to the detected type.
+#define XWAYLAND_PIXELS_PER_SCROLL_INCREMENT 10.
+#define XWAYLAND_HIGHRES_GESTURE_TIMEOUT_MS 100
+static void
+classify_xwayland_scroll(XIScrollDevice *d, double *x, double *y) {
+    const monotonic_t now = monotonic();
+    // Touchpad deltas can occasionally be multiples of 1/120 as well, so
+    // continue treating events as high resolution while a gesture is in progress
+    const bool in_highres_gesture = d->last_highres_event_at && now - d->last_highres_event_at < ms_to_monotonic_t(XWAYLAND_HIGHRES_GESTURE_TIMEOUT_MS);
+    if (!in_highres_gesture && is_multiple_of_v120_unit(*x) && is_multiple_of_v120_unit(*y)) {
+        d->offset_type = GLFW_SCROLL_OFFEST_V120;
+        *x *= 120.;
+        *y *= 120.;
+    } else {
+        d->offset_type = GLFW_SCROLL_OFFEST_HIGHRES;
+        d->last_highres_event_at = now;
+        *x *= XWAYLAND_PIXELS_PER_SCROLL_INCREMENT;
+        *y *= XWAYLAND_PIXELS_PER_SCROLL_INCREMENT;
+    }
+    debug_input("XWayland scroll event classified as: %s\n", d->offset_type == GLFW_SCROLL_OFFEST_V120 ? "v120" : "highres");
+}
+#undef XWAYLAND_PIXELS_PER_SCROLL_INCREMENT
+#undef XWAYLAND_HIGHRES_GESTURE_TIMEOUT_MS
+
 static void
 handle_xi_motion_event(_GLFWwindow *window, XIDeviceEvent *de) {
     XIScrollDevice *d = NULL;
@@ -1503,6 +1542,11 @@ handle_xi_motion_event(_GLFWwindow *window, XIDeviceEvent *de) {
             v->has_value = true;
             delta *= -1;
             double *off = v->is_vertical ? &yOffset : &xOffset;
+            if (d->is_xwayland) {
+                // Classified once all valuators in the event are known, below
+                *off = v->increment != 0 ? delta / v->increment : delta;
+                continue;
+            }
             *off = delta;
             d->num_events++;
             if (!d->type_detected) {
@@ -1513,7 +1557,7 @@ handle_xi_motion_event(_GLFWwindow *window, XIDeviceEvent *de) {
                     d->v120_offset_needs_scaling = false;
                 } else {
                     if (number_has_fractional_part(delta)) {
-                        if (fabs(delta * 120 - round(delta * 120)) < 0.01) {
+                        if (is_multiple_of_v120_unit(delta)) {
                             d->type_detected = d->num_events > 2;
                             d->offset_type = GLFW_SCROLL_OFFEST_V120;
                             d->v120_offset_needs_scaling = v->increment == 1.;
@@ -1537,6 +1581,7 @@ handle_xi_motion_event(_GLFWwindow *window, XIDeviceEvent *de) {
                 }
             }
         }
+        if (d->is_xwayland && (xOffset != 0 || yOffset != 0)) classify_xwayland_scroll(d, &xOffset, &yOffset);
         type = d->offset_type;
         if (xOffset != 0 || yOffset != 0) {
             // Get keyboard modifiers
@@ -1550,6 +1595,7 @@ handle_xi_motion_event(_GLFWwindow *window, XIDeviceEvent *de) {
                 .offset_type = type,
                 .source = d->is_finger_based ? GLFW_SCROLL_SOURCE_FINGER
                                              : (type == GLFW_SCROLL_OFFEST_HIGHRES ? GLFW_SCROLL_SOURCE_UNKNOWN : GLFW_SCROLL_SOURCE_WHEEL),
+                .timestamp = event_time_ms_to_monotonic((uint32_t)de->time),
             };
 
             // For high-resolution, finger-based scrolling, use a timer to detect
@@ -2153,19 +2199,43 @@ processEvent(XEvent *event) {
             else if (event->xbutton.button == Button4) {
                 if (!isEmulatedScrollButton(&event->xbutton))
                     _glfwInputScroll(
-                        window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .source = GLFW_SCROLL_SOURCE_WHEEL, .y_offset = 1, .unscaled.y = 1});
+                        window,
+                        &(GLFWScrollEvent){
+                            .keyboard_modifiers = mods,
+                            .source = GLFW_SCROLL_SOURCE_WHEEL,
+                            .y_offset = 1,
+                            .unscaled.y = 1,
+                            .timestamp = event_time_ms_to_monotonic((uint32_t)event->xbutton.time)});
             } else if (event->xbutton.button == Button5) {
                 if (!isEmulatedScrollButton(&event->xbutton))
                     _glfwInputScroll(
-                        window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .source = GLFW_SCROLL_SOURCE_WHEEL, .y_offset = -1, .unscaled.y = -1});
+                        window,
+                        &(GLFWScrollEvent){
+                            .keyboard_modifiers = mods,
+                            .source = GLFW_SCROLL_SOURCE_WHEEL,
+                            .y_offset = -1,
+                            .unscaled.y = -1,
+                            .timestamp = event_time_ms_to_monotonic((uint32_t)event->xbutton.time)});
             } else if (event->xbutton.button == Button6) {
                 if (!isEmulatedScrollButton(&event->xbutton))
                     _glfwInputScroll(
-                        window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .source = GLFW_SCROLL_SOURCE_WHEEL, .x_offset = 1, .unscaled.x = 1});
+                        window,
+                        &(GLFWScrollEvent){
+                            .keyboard_modifiers = mods,
+                            .source = GLFW_SCROLL_SOURCE_WHEEL,
+                            .x_offset = 1,
+                            .unscaled.x = 1,
+                            .timestamp = event_time_ms_to_monotonic((uint32_t)event->xbutton.time)});
             } else if (event->xbutton.button == Button7) {
                 if (!isEmulatedScrollButton(&event->xbutton))
                     _glfwInputScroll(
-                        window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .source = GLFW_SCROLL_SOURCE_WHEEL, .x_offset = -1, .unscaled.x = -1});
+                        window,
+                        &(GLFWScrollEvent){
+                            .keyboard_modifiers = mods,
+                            .source = GLFW_SCROLL_SOURCE_WHEEL,
+                            .x_offset = -1,
+                            .unscaled.x = -1,
+                            .timestamp = event_time_ms_to_monotonic((uint32_t)event->xbutton.time)});
             }
 
             else {

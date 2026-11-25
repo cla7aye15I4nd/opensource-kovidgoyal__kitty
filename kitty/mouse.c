@@ -1925,18 +1925,14 @@ wheel_event_source(GLFWScrollSource s) {
     return 0;
 }
 
-// Formats a positive number as a short decimal, without an exponent or
-// trailing zeros, as needed by the escape code
-static void
-format_wheel_multiplier(double val, char *buf, size_t sz) {
-    if (!isfinite(val) || val < 0) val = 0;
-    int n = snprintf(buf, sz, "%.3f", val);
-    if (n <= 0 || (size_t)n >= sz) {
-        snprintf(buf, sz, "1");
-        return;
-    }
-    while (n > 1 && buf[n - 1] == '0') buf[--n] = 0;
-    if (n > 1 && buf[n - 1] == '.') buf[--n] = 0;
+// Converts a scroll multiplier to the whole number of thousandths sent in the
+// escape code. A decimal point cannot be used as it is not a valid CSI
+// parameter byte.
+static unsigned
+wheel_multiplier_in_thousandths(double val) {
+    if (!isfinite(val) || val <= 0) return 0;
+    const double ans = round(val * 1000);
+    return ans > UINT_MAX ? UINT_MAX : (unsigned)ans;
 }
 
 // Adds delta to the unreported remainder and returns the whole part of the
@@ -1951,6 +1947,19 @@ take_whole_wheel_delta(double delta, double *remainder) {
     if (whole > INT_MAX) return INT_MAX;
     if (whole < -INT_MAX) return -INT_MAX;
     return (int)whole;
+}
+
+// Returns the time of an event as reported to the program, in microseconds
+// since the mode was turned on. Reported times never decrease, as events can
+// come from different sources, such as the system and the synthesized momentum
+// scrolling, whose clocks need not agree.
+static unsigned long long
+wheel_event_timestamp(Screen *screen, monotonic_t timestamp) {
+    const monotonic_t since_origin = timestamp - screen->wheel_events_clock.origin;
+    unsigned long long ans = since_origin > 0 ? (unsigned long long)(since_origin / 1000) : 0;
+    if (ans < screen->wheel_events_clock.last_reported) ans = screen->wheel_events_clock.last_reported;
+    screen->wheel_events_clock.last_reported = ans;
+    return ans;
 }
 
 // Reports a scroll event to the program in the detailed wheel event format.
@@ -2004,23 +2013,22 @@ encode_wheel_event(OSWindow *osw, Window *w, const GLFWScrollEvent *ev) {
         x = (int)round(w->mouse_pos.global_x);
         y = (int)round(w->mouse_pos.global_y);
     }
-    char mult[32];
-    format_wheel_multiplier(fabs(multiplier), mult, sizeof(mult));
     const unsigned mods = 1 + ((unsigned)ev->keyboard_modifiers & 0xff);
     const int n = snprintf(
         mouse_event_buf,
         sizeof(mouse_event_buf),
-        ">%d;%d;%d;%d;%d:%s;%u;%u;%u;%uM",
+        ">%d;%d;%d;%d;%d:%u;%u;%u;%u;%u;%lluM",
         x,
         y,
         idx,
         idy,
         unit,
-        mult,
+        wheel_multiplier_in_thousandths(fabs(multiplier)),
         wheel_event_source(ev->source),
         phase,
         flags,
-        mods);
+        mods,
+        wheel_event_timestamp(screen, ev->timestamp));
     if (n <= 0 || (size_t)n >= sizeof(mouse_event_buf)) {
         log_error("Detailed wheel event too long to encode");
         return 0;
@@ -2431,9 +2439,11 @@ send_mock_scroll_event_to_window(PyObject *self UNUSED, PyObject *args) {
     PyObject *capsule;
     GLFWScrollEvent ev = {0};
     int offset_type, momentum_type = GLFW_NO_MOMENTUM_DATA, source = GLFW_SCROLL_SOURCE_UNKNOWN, phase = GLFW_SCROLL_PHASE_NONE, inverted = 0;
+    // The time of the event in microseconds since the wheel events mode was turned on
+    long long timestamp_us = 0;
     if (!PyArg_ParseTuple(
             args,
-            "O!iddi|iiip",
+            "O!iddi|iiipL",
             &PyCapsule_Type,
             &capsule,
             &offset_type,
@@ -2443,7 +2453,8 @@ send_mock_scroll_event_to_window(PyObject *self UNUSED, PyObject *args) {
             &momentum_type,
             &source,
             &phase,
-            &inverted))
+            &inverted,
+            &timestamp_us))
         return NULL;
     Window *w = PyCapsule_GetPointer(capsule, "Window");
     if (!w) return NULL;
@@ -2456,6 +2467,7 @@ send_mock_scroll_event_to_window(PyObject *self UNUSED, PyObject *args) {
     ev.direction_inverted = inverted;
     ev.unscaled.x = ev.x_offset;
     ev.unscaled.y = ev.y_offset;
+    ev.timestamp = w->render_data.screen->wheel_events_clock.origin + timestamp_us * 1000;
     scroll_event_in_window(&osw, w, &ev, w->render_data.screen->cell_size.width, w->render_data.screen->cell_size.height);
     Py_RETURN_NONE;
 }

@@ -146,7 +146,8 @@ Detailed list of changes
 
 - A new mode (``5523``) to :ref:`report scroll events to programs in full detail
   <detailed_wheel_events>`, with pixel or high resolution deltas, the device
-  kind, gesture phase and momentum/natural scrolling flags. Kittens can use it
+  kind, gesture phase, momentum/natural scrolling flags and the time of the
+  event. Kittens can use it
   via ``Loop.DetailedWheelEvents()``
 
 - Initial support for the proposed glyph protocol (:iss:`10872`), allowing
@@ -234,6 +235,14 @@ Detailed list of changes
 - Building kitty now requires libfribidi, libbrotlidec (except on macOS) and,
   for the Vulkan driver, the Vulkan headers. The Go SIMD code now uses the
   Go ``simd`` package with ``GOEXPERIMENT=simd``
+
+- XWayland: Fix scrolling with the touchpad being too slow, and becoming much
+  too fast or the mouse wheel not scrolling, when both a touchpad and a mouse
+  wheel are used (:iss:`10938`)
+
+- Linux: Fix events for file descriptors being dispatched to the wrong handler
+  when a handler, such as a drag and drop or DBus one, stops watching a file
+  descriptor while events are being processed
 
 0.51.1 [2026-11-23]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
