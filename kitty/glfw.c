@@ -1050,8 +1050,37 @@ cancel_os_window_bell_attention(OSWindow *w) {
     }
 }
 
+static void window_focus_callback(GLFWwindow *w, int focused);
+
+static void
+unfocus_stale_os_windows(GLFWwindow *focused_window) {
+    // On macOS, new windows are assumed to be focused when created, as macOS
+    // does not send the focus in event until the window is shown. If the
+    // window never actually becomes key, for instance, because it was created
+    // with --keep-focus and focus went back to another window, it never gets
+    // a focus out event and remains focused. Since only one window can be key,
+    // when a window gets focus, any other window that is still marked focused
+    // but is not actually key is stale, so send it a focus out.
+    id_type stale[16];
+    size_t num_stale = 0;
+    for (size_t i = 0; i < global_state.num_os_windows && num_stale < arraysz(stale); i++) {
+        OSWindow *q = global_state.os_windows + i;
+        if (q->handle && q->handle != focused_window && q->is_focused && !glfwGetWindowAttrib(q->handle, GLFW_FOCUSED)) stale[num_stale++] = q->id;
+    }
+    // Look the windows up again each time, as the callback calls into Python,
+    // which can close OS windows
+    for (size_t i = 0; i < num_stale; i++) {
+        OSWindow *q = os_window_for_id(stale[i]);
+        if (q && q->handle && q->is_focused) {
+            debug_input("Unfocusing OS window 0x%llu as it is not actually focused\n", q->id);
+            window_focus_callback(q->handle, 0);
+        }
+    }
+}
+
 static void
 window_focus_callback(GLFWwindow *w, int focused) {
+    if (focused && global_state.is_apple) unfocus_stale_os_windows(w);
     if (!set_callback_window(w)) return;
 #define osw global_state.callback_os_window
     debug_input("\x1b[35mon_focus_change\x1b[m: window id: 0x%llu focused: %d\n", osw->id, focused);
@@ -2710,13 +2739,6 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         w->hide_on_focus_loss = lsc->hide_on_focus_loss;
     }
     update_os_window_references();
-    if (!w->is_layer_shell || (global_state.is_apple && w->is_layer_shell && lsc->focus_policy == GLFW_FOCUS_EXCLUSIVE)) {
-        for (size_t i = 0; i < global_state.num_os_windows; i++) {
-            // On some platforms (macOS) newly created windows don't get the initial focus in event
-            OSWindow *q = global_state.os_windows + i;
-            q->is_focused = q == w ? true : false;
-        }
-    }
     w->fonts_data = fonts_data;
     w->shown_once = true;
     w->last_focused_counter = ++focus_counter;
@@ -2751,8 +2773,21 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     glfwSetDragSourceCallback(glfw_window, drag_source_callback);
     glfwSetDropEventCallback(glfw_window, drop_dest_callback);
     monotonic_t now = monotonic();
-    w->is_focused = true;
-    record_os_window_focus_change_for_shaders(w, true);
+    // The initial focus in event can arrive while the window is being
+    // created, before the focus callback is set, so use the actual focus
+    // state, the compositor/window manager might not focus a new window at
+    // all, for instance, due to focus stealing prevention. macOS does not send
+    // the initial focus in event for newly created windows, so there, windows
+    // that are shown and can take keyboard focus are assumed to get it.
+    const bool initially_focused = global_state.is_apple ? window_state != WINDOW_HIDDEN && (!lsc || lsc->focus_policy == GLFW_FOCUS_EXCLUSIVE)
+                                                         : glfwGetWindowAttrib(glfw_window, GLFW_FOCUSED) != 0;
+    if (initially_focused) {
+        for (size_t i = 0; i < global_state.num_os_windows; i++) {
+            OSWindow *q = global_state.os_windows + i;
+            q->is_focused = q == w ? true : false;
+        }
+        record_os_window_focus_change_for_shaders(w, true);
+    }
     w->cursor_blink_zero_time = now;
     w->last_mouse_activity_at = now;
     w->mouse_activate_deadline = -1;
@@ -3166,6 +3201,14 @@ glfw_get_system_color_theme(PyObject UNUSED *self, PyObject *args) {
 }
 
 static PyObject *
+glfw_get_icon_theme_name(PyObject UNUSED *self, PyObject *args UNUSED) {
+    // Returns an empty string if GLFW is not loaded or the desktop settings do
+    // not specify an icon theme.
+    const char *name = glfwGetIconThemeName ? glfwGetIconThemeName() : NULL;
+    return PyUnicode_FromString(name ? name : "");
+}
+
+static PyObject *
 glfw_get_key_name(PyObject UNUSED *self, PyObject *args) {
     int key, native_key;
     if (!PyArg_ParseTuple(args, "ii", &key, &native_key)) return NULL;
@@ -3397,9 +3440,16 @@ static void
 activation_token_callback(GLFWwindow *window UNUSED, const char *token, void *data) {
     if (!token || !token[0]) {
         token = "";
-        log_error("Wayland: Did not get activation token from compositor. Use a better compositor.");
+        // Programs can request tokens via OSC 5524, so do not flood the log
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            log_error("Wayland: Did not get activation token from compositor. Use a better compositor.");
+        }
     }
-    PyObject *ret = PyObject_CallFunction(data, "s", token);
+    // Tokens should be UTF-8, but the compositor might not ensure it
+    RAII_PyObject(pytoken, PyUnicode_DecodeUTF8(token, strlen(token), "replace"));
+    PyObject *ret = pytoken ? PyObject_CallFunctionObjArgs(data, pytoken, NULL) : NULL;
     if (ret == NULL) PyErr_Print();
     else Py_DECREF(ret);
     Py_CLEAR(data);
@@ -4429,6 +4479,7 @@ static PyMethodDef module_methods[] = {
     METHODB(wayland_compositor_data, METH_NOARGS),
     METHODB(get_click_interval, METH_NOARGS),
     METHODB(glfw_get_keyboard_repeat_interval, METH_NOARGS),
+    METHODB(glfw_get_icon_theme_name, METH_NOARGS),
     METHODB(is_layer_shell_supported, METH_NOARGS),
     METHODB(x11_window_id, METH_O),
     METHODB(strip_csi, METH_O),

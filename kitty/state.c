@@ -1132,6 +1132,22 @@ PYWRAP0(last_focused_os_window_id) { return PyLong_FromUnsignedLongLong(last_foc
 
 PYWRAP0(current_focused_os_window_id) { return PyLong_FromUnsignedLongLong(current_focused_os_window_id()); }
 
+PYWRAP1(seconds_since_last_user_input) {
+    id_type window_id = PyLong_AsUnsignedLongLong(args);
+    if (PyErr_Occurred()) return NULL;
+    Window *w = window_for_window_id(window_id);
+    if (!w || !w->last_user_input_at) return PyFloat_FromDouble(-1);
+    return PyFloat_FromDouble(monotonic_t_to_s_double(monotonic() - w->last_user_input_at));
+}
+
+PYWRAP1(is_os_window_focused) {
+    id_type os_window_id = PyLong_AsUnsignedLongLong(args);
+    if (PyErr_Occurred()) return NULL;
+    OSWindow *w = os_window_for_id(os_window_id);
+    if (w && w->is_focused) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
 
 PYWRAP1(handle_for_window_id) {
     id_type os_window_id;
@@ -1370,17 +1386,31 @@ PYWRAP0(application_logout_requested_at) {
 
 PYWRAP1(focus_os_window) {
     id_type os_window_id;
-    int also_raise = 1;
+    int also_raise = 1, force = 0;
     const char *activation_token = NULL;
-    PA("K|pz", &os_window_id, &also_raise, &activation_token);
+    PA("K|pzp", &os_window_id, &also_raise, &activation_token, &force);
     WITH_OS_WINDOW(os_window_id)
-    if (!os_window->is_focused || (activation_token && activation_token[0])) focus_os_window(os_window, also_raise, activation_token);
+    // force is needed when the OS window might not actually have focus, even
+    // though it is marked focused, for instance, while the window manager has
+    // yet to focus a newly created OS window
+    if (force || !os_window->is_focused || (activation_token && activation_token[0])) focus_os_window(os_window, also_raise, activation_token);
     Py_RETURN_TRUE;
     END_WITH_OS_WINDOW
     Py_RETURN_FALSE;
 }
 
 PYWRAP1(run_with_activation_token) {
+    PyObject *callback;
+    unsigned long long requested_os_window_id = 0;
+    if (!PyArg_ParseTuple(args, "O|K", &callback, &requested_os_window_id)) return NULL;
+    args = callback;
+    if (requested_os_window_id) {
+        // Get the token for the specified OS window, it must have keyboard focus
+        OSWindow *os_window = os_window_for_id(requested_os_window_id);
+        if (!os_window || !os_window->is_focused) Py_RETURN_FALSE;
+        run_with_activation_token_in_os_window(os_window, args);
+        Py_RETURN_TRUE;
+    }
     for (size_t o = 0; o < global_state.num_os_windows; o++) {
         OSWindow *os_window = global_state.os_windows + o;
         if (os_window->is_focused) {
@@ -2212,6 +2242,8 @@ static PyMethodDef module_methods[] = {
     MW(next_window_id, METH_NOARGS),
     MW(last_focused_os_window_id, METH_NOARGS),
     MW(current_focused_os_window_id, METH_NOARGS),
+    MW(is_os_window_focused, METH_O),
+    MW(seconds_since_last_user_input, METH_O),
     MW(set_options, METH_VARARGS),
     MW(get_options, METH_NOARGS),
     MW(click_mouse_url, METH_VARARGS),
@@ -2258,7 +2290,7 @@ static PyMethodDef module_methods[] = {
     MW(focus_os_window, METH_VARARGS),
     MW(mark_tab_bar_dirty, METH_VARARGS),
     MW(is_tab_bar_visible, METH_VARARGS),
-    MW(run_with_activation_token, METH_O),
+    MW(run_with_activation_token, METH_VARARGS),
     MW(change_background_opacity, METH_VARARGS),
     MW(background_opacity_of, METH_O),
     MW(update_window_visibility, METH_VARARGS),

@@ -125,6 +125,22 @@ Detailed list of changes
 1.0.0 [future]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+- A new :doc:`choose-app kitten </kittens/choose-app>` to choose the
+  application used to open files and URLs, from a grid of application icons,
+  using a keyboard first interface. It finds applications the same way KDE and
+  GNOME do, remembers choices and can be used as a replacement for
+  :program:`xdg-open`. The :doc:`desktop-ui kitten </kittens/desktop-ui>`
+  uses it to implement the AppChooser portal, used by programs such as
+  Flatpaks to choose the application to open files and links with
+
+- A new escape code to allow programs to request :ref:`XDG activation tokens
+  <activation_tokens>`, so that programs they launch can get keyboard focus on
+  Wayland
+
+- :doc:`desktop-ui kitten </kittens/desktop-ui>`: Provide the icon theme to
+  programs via the settings portal, from the new ``icon_theme`` option or the
+  KDE and GTK configuration
+
 - New rendering engine with pluggable GPU drivers: kitty now renders with
   **Metal** on macOS and **Vulkan** on Linux and BSD, falling back to OpenGL.
   On systems with no usable GPU, such as virtual machines, it falls back to
@@ -284,6 +300,14 @@ Detailed list of changes
 
 - Fix screenshots and thumbnails no longer working after two were requested
   at the same time
+
+- Linux: Desktop notifications: Look up icon names in the icon theme
+  configured in the desktop settings instead of only the default theme, so
+  that icons from themes such as Breeze are found. When none of the names are
+  found, pass the last one to the notification server instead of the first
+
+- Preserve the existing destination when the transfer kitten fails to create a
+  received symbolic or hard link
 
 0.51.1 [2026-11-23]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -21,6 +21,8 @@ import (
 	"github.com/kovidgoyal/dbus"
 	"github.com/kovidgoyal/dbus/introspect"
 	"github.com/kovidgoyal/dbus/prop"
+	"github.com/kovidgoyal/kitty/kittens/choose_app"
+	"github.com/kovidgoyal/kitty/tools/tui"
 	"github.com/kovidgoyal/kitty/tools/utils"
 	"github.com/kovidgoyal/kitty/tools/utils/shlex"
 	"github.com/kovidgoyal/kitty/tools/utils/style"
@@ -33,10 +35,13 @@ const PORTAL_APPEARANCE_NAMESPACE = "org.freedesktop.appearance"
 const PORTAL_COLOR_SCHEME_KEY = "color-scheme"
 const PORTAL_ACCENT_COLOR_KEY = "accent-color"
 const PORTAL_CONTRAST_KEY = "contrast"
+const PORTAL_INTERFACE_NAMESPACE = "org.gnome.desktop.interface"
+const PORTAL_ICON_THEME_KEY = "icon-theme"
 const PORTAL_BUS_NAME = "org.freedesktop.impl.portal.desktop.kitty"
 const DESKTOP_OBJECT_PATH = "/org/freedesktop/portal/desktop"
 const SETTINGS_INTERFACE = "org.freedesktop.impl.portal.Settings"
 const FILE_CHOOSER_INTERFACE = "org.freedesktop.impl.portal.FileChooser"
+const APP_CHOOSER_INTERFACE = "org.freedesktop.impl.portal.AppChooser"
 const KITTY_OBJECT_PATH = "/net/kovidgoyal/kitty/portal"
 const CHANGE_SETTINGS_INTERFACE = "net.kovidgoyal.kitty.settings"
 const DESKTOP_PORTAL_NAME = "org.freedesktop.portal.Desktop"
@@ -106,7 +111,20 @@ func NewPortal(opts *Config, server_options *ServerOptions) (p *Portal, err erro
 		contrast = 1
 	}
 	ans.settings[PORTAL_APPEARANCE_NAMESPACE][PORTAL_CONTRAST_KEY] = dbus.MakeVariant(contrast)
+	if theme := icon_theme(opts); theme != "" {
+		ans.settings[PORTAL_INTERFACE_NAMESPACE] = map[string]dbus.Variant{PORTAL_ICON_THEME_KEY: dbus.MakeVariant(theme)}
+	}
 	return &ans, nil
+}
+
+// icon_theme returns the icon theme from the settings, or the KDE and GTK
+// configuration files. It must not use the settings portal, as this is the
+// settings portal.
+func icon_theme(opts *Config) string {
+	if opts.Icon_theme != "" {
+		return opts.Icon_theme
+	}
+	return choose_app.XDGDirsFromEnvironment().IconThemeFromConfigFiles()
 }
 
 type PropSpec map[string]*prop.Prop
@@ -214,13 +232,22 @@ func (self *Portal) Start() (err error) {
 	}
 	methods = MethodSpec{
 		"OpenFile": {{"handle", "o", false}, {"app_id", "s", false}, {"parent_window", "s", false}, {"title", "s", false}, {"options", "a{sv}", false},
-			{"response", "u", true}, {"results", "a{sv}", false},
+			{"response", "u", true}, {"results", "a{sv}", true},
 		},
 		"SaveFile": {{"handle", "o", false}, {"app_id", "s", false}, {"parent_window", "s", false}, {"title", "s", false}, {"options", "a{sv}", false},
-			{"response", "u", true}, {"results", "a{sv}", false},
+			{"response", "u", true}, {"results", "a{sv}", true},
 		},
 	}
 	if err = ExportInterface(self.bus, self, FILE_CHOOSER_INTERFACE, DESKTOP_OBJECT_PATH, methods, nil, nil); err != nil {
+		return
+	}
+	methods = MethodSpec{
+		"ChooseApplication": {{"handle", "o", false}, {"app_id", "s", false}, {"parent_window", "s", false}, {"choices", "as", false}, {"options", "a{sv}", false},
+			{"response", "u", true}, {"results", "a{sv}", true},
+		},
+		"UpdateChoices": {{"handle", "o", false}, {"choices", "as", false}},
+	}
+	if err = ExportInterface(self.bus, self, APP_CHOOSER_INTERFACE, DESKTOP_OBJECT_PATH, methods, nil, nil); err != nil {
 		return
 	}
 	methods = MethodSpec{
@@ -285,8 +312,10 @@ func show_settings(opts *ShowSettingsOptions) (err error) {
 		return fmt.Errorf("failed to connect to system bus with error: %w", err)
 	}
 	defer conn.Close()
-	var response ReadAllType
-	response, err = fetch_settings(conn, opts.InNamespace...)
+	response, err := fetch_settings(conn, opts.InNamespace...)
+	if err != nil {
+		return err
+	}
 	if opts.AsJson {
 		unwrapped := make(map[string]map[string]any, len(response))
 		for ns, m := range response {
@@ -310,15 +339,28 @@ func show_settings(opts *ShowSettingsOptions) (err error) {
 		}
 	}
 	if !opts.AllowOtherBackends {
-		is_running_self := false
-		if m, found := response[SETTINGS_CANARY_NAMESPACE]; found {
-			_, is_running_self = m[SETTINGS_CANARY_KEY]
+		canary := response
+		if _, found := response[SETTINGS_CANARY_NAMESPACE]; !found && len(opts.InNamespace) > 0 {
+			// The namespace used to detect this kitten was not requested, so fetch it separately
+			if canary, err = fetch_settings(conn, SETTINGS_CANARY_NAMESPACE); err != nil {
+				return fmt.Errorf("failed to check which portal backend provides the settings: %w", err)
+			}
 		}
-		if !is_running_self {
-			err = fmt.Errorf("the settings did not come from the desktop-ui kitten. Some other portal backend is providing the service.")
+		if !has_settings_canary(canary) {
+			return fmt.Errorf("the settings did not come from the desktop-ui kitten. Some other portal backend is providing the service.")
 		}
 	}
-	return
+	return nil
+}
+
+// has_settings_canary returns true if the settings contain the setting
+// that only this kitten provides
+func has_settings_canary(settings ReadAllType) bool {
+	if m, found := settings[SETTINGS_CANARY_NAMESPACE]; found {
+		_, found = m[SETTINGS_CANARY_KEY]
+		return found
+	}
+	return false
 }
 
 var DataDirs = sync.OnceValue(func() (ans []string) {
@@ -354,7 +396,7 @@ var WritableDataDirs = sync.OnceValue(func() (ans []string) {
 })
 
 var AllPortalInterfaces = sync.OnceValue(func() (ans []string) {
-	return []string{SETTINGS_INTERFACE, FILE_CHOOSER_INTERFACE}
+	return []string{SETTINGS_INTERFACE, FILE_CHOOSER_INTERFACE, APP_CHOOSER_INTERFACE}
 })
 
 // enable-portal {{{
@@ -761,12 +803,16 @@ type ChooserResponse struct {
 	Current_filter string   `json:"current_filter"`
 }
 
-func (self *Portal) run_file_chooser(cfd ChooseFilesData) (response uint32, result_dict vmap) {
+// run_kitten_in_panel runs a kitten in a kitty overlay panel, to handle the
+// portal request with the specified handle. kitten_args returns the command
+// line for the kitten, which must write its output to output_path and its
+// process id to pid_path. Returns the output of the kitten, or ok=false if
+// the kitten failed or the request was closed.
+func (self *Portal) run_kitten_in_panel(handle dbus.ObjectPath, what, size string, kitten_args func(output_path, pid_path string) []string) (output []byte, ok bool) {
 	self.reload_portal_settings()
-	response = RESPONSE_ENDED
 	tdir, err := os.MkdirTemp("", "kitty-cfd")
 	if err != nil {
-		log.Println("cannot run file chooser as failed to create a temporary directory with error: ", err)
+		log.Printf("cannot run %s as failed to create a temporary directory with error: %s", what, err)
 		return
 	}
 	pid_path := filepath.Join(tdir, "pid")
@@ -783,9 +829,9 @@ func (self *Portal) run_file_chooser(cfd ChooseFilesData) (response uint32, resu
 		}
 		return nil
 	}
-	self.bus.ExportMethodTable(map[string]any{"Close": Close}, cfd.Handle, REQUEST_INTERFACE)
+	self.bus.ExportMethodTable(map[string]any{"Close": Close}, handle, REQUEST_INTERFACE)
 	defer func() {
-		self.bus.ExportMethodTable(nil, cfd.Handle, REQUEST_INTERFACE)
+		self.bus.ExportMethodTable(nil, handle, REQUEST_INTERFACE)
 		_ = os.RemoveAll(tdir)
 	}()
 	output_path := filepath.Join(tdir, "output.json")
@@ -793,32 +839,16 @@ func (self *Portal) run_file_chooser(cfd ChooseFilesData) (response uint32, resu
 	cmd := func() *exec.Cmd {
 		self.lock.Lock()
 		defer self.lock.Unlock()
-		edge, lines, columns := `center`, ``, ``
-		if self.opts.File_chooser_size != "" {
-			l, c, _ := strings.Cut(strings.TrimSpace(self.opts.File_chooser_size), " ")
-			l, c = strings.TrimSpace(l), strings.TrimSpace(c)
-			if li, err := strconv.Atoi(l); err == nil {
-				if ci, err := strconv.Atoi(c); err == nil {
-					if li < 10 || ci < 40 {
-						log.Printf("file chooser size %s too small, ignoring", self.opts.File_chooser_size)
-					} else {
-						edge, lines, columns = `center-sized`, l, c
-					}
-				} else {
-					log.Printf("file chooser size %s invalid with error: %s\n", self.opts.File_chooser_size, err)
-				}
-			} else {
-				log.Printf("file chooser size %s invalid with error: %s\n", self.opts.File_chooser_size, err)
-			}
+		size_args, err := tui.CenteredPanelArgs(size)
+		if err != nil {
+			log.Printf("ignoring the %s size: %s", what, err)
 		}
 		args := []string{
-			"+kitten", "panel", "--layer=overlay", "--edge=" + edge, "--focus-policy=exclusive",
+			"+kitten", "panel", "--layer=overlay", "--focus-policy=exclusive",
 			"-o", "background_opacity=0.85", "--wait-for-single-instance-window-close",
 			"--grab-keyboard", "--single-instance", "--instance-group", "cfp-" + strconv.Itoa(os.Getpid()),
 		}
-		if edge == "center-sized" {
-			args = append(args, "--lines="+lines, "--columns="+columns)
-		}
+		args = append(args, size_args...)
 		for _, x := range self.opts.File_chooser_kitty_conf {
 			args = append(args, `-c`, x)
 		}
@@ -828,7 +858,7 @@ func (self *Portal) run_file_chooser(cfd ChooseFilesData) (response uint32, resu
 		if self.file_chooser_first_instance != nil {
 			select {
 			case <-self.file_chooser_first_instance_exited:
-				log.Println("file chooser panel process exited, restarting it")
+				log.Println("chooser panel process exited, restarting it")
 				self.file_chooser_first_instance = nil
 				self.file_chooser_first_instance_exited = nil
 			default:
@@ -837,7 +867,7 @@ func (self *Portal) run_file_chooser(cfd ChooseFilesData) (response uint32, resu
 		if self.file_chooser_first_instance == nil {
 			fifo_path := filepath.Join(tdir, "fifo")
 			if err := unix.Mkfifo(fifo_path, 0600); err != nil {
-				log.Println("cannot run file chooser as failed to create a fifo directory with error: ", err)
+				log.Printf("cannot run %s as failed to create a fifo with error: %s", what, err)
 				return nil
 			}
 			fa := slices.Clone(args)
@@ -846,7 +876,7 @@ func (self *Portal) run_file_chooser(cfd ChooseFilesData) (response uint32, resu
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			if err := cmd.Start(); err != nil {
-				log.Println("cannot run file chooser as failed to start kitty panel with error: ", err)
+				log.Printf("cannot run %s as failed to start kitty panel with error: %s", what, err)
 				return nil
 			}
 			exited := make(chan struct{})
@@ -858,7 +888,7 @@ func (self *Portal) run_file_chooser(cfd ChooseFilesData) (response uint32, resu
 			go func() {
 				f, err := os.OpenFile(fifo_path, os.O_RDONLY, os.ModeNamedPipe)
 				if err != nil {
-					log.Println("cannot run file chooser as failed to open fifo for read with error: ", err)
+					log.Printf("cannot run %s as failed to open fifo for read with error: %s", what, err)
 					return
 				}
 				defer f.Close()
@@ -879,17 +909,49 @@ func (self *Portal) run_file_chooser(cfd ChooseFilesData) (response uint32, resu
 				self.file_chooser_first_instance_exited = exited
 			case <-exited:
 				unblock_reader()
-				log.Printf("cannot run file chooser as the kitty panel process exited with %s, check its output above for errors. "+
-					"Note that the file chooser requires the window manager/compositor to support panels, see "+
-					"https://sw.kovidgoyal.net/kitty/kittens/panel/#compatibility-with-various-platforms", cmd.ProcessState)
+				log.Printf("cannot run %s as the kitty panel process exited with %s, check its output above for errors. "+
+					"Note that the %s requires the window manager/compositor to support panels, see "+
+					"https://sw.kovidgoyal.net/kitty/kittens/panel/#compatibility-with-various-platforms", what, cmd.ProcessState, what)
 				return nil
 			case <-time.After(5 * time.Second):
 				unblock_reader()
-				log.Println("cannot run file chooser as panel script timed out writing to fifo")
+				log.Printf("cannot run %s as panel script timed out writing to fifo", what)
 				return nil
 			}
 		}
-		args = append(args, "kitten", `choose-files`, `--mode`, cfd.Mode, `--write-output-to`, output_path, `--output-format=json`, `--display-title`)
+		args = append(args, "kitten")
+		args = append(args, kitten_args(output_path, pid_path)...)
+		cmd := exec.Command(utils.KittyExe(), args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd
+	}()
+	if cmd == nil || close_requested.Load() {
+		return
+	}
+	log.Printf("running %s with args: %s %s", what, cmd.Path, utils.Repr(cmd.Args))
+	if err := cmd.Run(); err != nil {
+		log.Printf("running %s failed with error: %s", what, err)
+		return
+	}
+	if close_requested.Load() {
+		return
+	}
+	output, err = os.ReadFile(output_path)
+	if err != nil {
+		log.Printf("running %s failed, could not read from output file with error: %s", what, err)
+		return
+	}
+	if close_requested.Load() {
+		return
+	}
+	return output, true
+}
+
+func (self *Portal) run_file_chooser(cfd ChooseFilesData) (response uint32, result_dict vmap) {
+	response = RESPONSE_ENDED
+	kitten_args := func(output_path, pid_path string) []string {
+		args := []string{`choose-files`, `--mode`, cfd.Mode, `--write-output-to`, output_path, `--output-format=json`, `--display-title`}
 		if cfd.SuggestedSaveFileName != "" {
 			args = append(args, `--suggested-save-file-name`, cfd.SuggestedSaveFileName)
 		}
@@ -905,44 +967,23 @@ func (self *Portal) run_file_chooser(cfd ChooseFilesData) (response uint32, resu
 			}
 		}
 		args = append(args, "--write-pid-to", pid_path)
-		target := cfd.Cwd
-		if target == "" {
-			target = "~"
-		} else {
+		target := "~"
+		if cfd.Cwd != "" {
 			if st, err := os.Stat(cfd.Cwd); err == nil && st.IsDir() && unix.Access(cfd.Cwd, unix.R_OK|unix.X_OK) == nil {
 				target = cfd.Cwd
-			} else {
-				target = "~"
 			}
-
 		}
-		args = append(args, target)
-		cmd := exec.Command(utils.KittyExe(), args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return cmd
-	}()
-	if cmd == nil || close_requested.Load() {
-		return
+		return append(args, target)
 	}
-	log.Println("running file chooser with args:", cmd.Path, utils.Repr(cmd.Args))
-	if err := cmd.Run(); err != nil {
-		log.Println("running file chooser failed with error: ", err)
-		return
-	}
-	if close_requested.Load() {
-		return
-	}
-	raw, err := os.ReadFile(output_path)
-	if err != nil {
-		log.Println("running file chooser failed, could not read from output file with error: ", err)
-		return
-	}
-	if close_requested.Load() {
+	self.lock.Lock()
+	size := self.opts.File_chooser_size
+	self.lock.Unlock()
+	raw, ok := self.run_kitten_in_panel(cfd.Handle, "file chooser", size, kitten_args)
+	if !ok {
 		return
 	}
 	var result ChooserResponse
-	if err = json.Unmarshal(raw, &result); err != nil {
+	if err := json.Unmarshal(raw, &result); err != nil {
 		log.Println("running file chooser failed, invalid JSON response with error: ", err)
 		return
 	}
@@ -1009,3 +1050,118 @@ func (self *Portal) SaveFile(handle dbus.ObjectPath, app_id string, parent_windo
 	response, result := self.run_file_chooser(cfd)
 	return response, result, nil
 }
+
+// AppChooser {{{
+
+func (options vmap) get_string(name string) string {
+	if v, found := options[name]; found {
+		var ans string
+		if v.Store(&ans) == nil {
+			return ans
+		}
+	}
+	return ""
+}
+
+type ChooseAppData struct {
+	Handle                            dbus.ObjectPath
+	Choices                           []string
+	LastChoice, ContentType, Filename string
+	Uri                               string
+}
+
+// choose_app_args returns the command line for the choose-app kitten
+func choose_app_args(cad ChooseAppData, output_path, pid_path string) []string {
+	args := []string{
+		"choose-app", "--output-format=json", "--write-output-to", output_path, "--write-pid-to", pid_path,
+		"--commands-as-desktop-files", "--title", "Open with",
+	}
+	content_type := cad.ContentType
+	if content_type == "" && cad.Filename != "" {
+		content_type = utils.GuessMimeType(cad.Filename)
+	}
+	if content_type != "" {
+		args = append(args, "--content-type", content_type)
+	}
+	if name := utils.IfElse(cad.Filename != "", cad.Filename, cad.Uri); name != "" {
+		args = append(args, "--display-name", name)
+	}
+	for _, c := range cad.Choices {
+		args = append(args, "--recommend", c)
+	}
+	if cad.LastChoice != "" {
+		args = append(args, "--preselect", cad.LastChoice)
+	}
+	return args
+}
+
+type AppChooserResponse struct {
+	Choice struct {
+		Desktop_id string `json:"desktop_id"`
+	} `json:"choice"`
+	Error            string `json:"error"`
+	Interrupted      bool   `json:"interrupted"`
+	Activation_token string `json:"activation_token"`
+}
+
+// parse_app_chooser_response returns the portal response for the output of
+// the choose-app kitten
+func parse_app_chooser_response(raw []byte, activation_token string) (response uint32, results vmap) {
+	response = RESPONSE_ENDED
+	var result AppChooserResponse
+	if err := json.Unmarshal(raw, &result); err != nil {
+		log.Println("running app chooser failed, invalid JSON response with error: ", err)
+		return
+	}
+	switch {
+	case result.Error != "":
+		log.Println("running app chooser failed, with error: ", result.Error)
+		return
+	case result.Interrupted:
+		log.Println("app chooser cancelled by user.")
+		return RESPONSE_CANCELED, nil
+	case result.Choice.Desktop_id == "":
+		log.Println("running app chooser failed, no application chosen")
+		return
+	}
+	// The portal uses desktop file ids without the .desktop suffix
+	results = vmap{"choice": dbus.MakeVariant(strings.TrimSuffix(result.Choice.Desktop_id, ".desktop"))}
+	// The spec requires a new token when the user interacted with the
+	// chooser, use the one the chooser got from the terminal, if any,
+	// otherwise return the one we were given, as allowed by the spec
+	if result.Activation_token != "" {
+		activation_token = result.Activation_token
+	}
+	if activation_token != "" {
+		results["activation_token"] = dbus.MakeVariant(activation_token)
+	}
+	return RESPONSE_SUCCESS, results
+}
+
+func (self *Portal) ChooseApplication(handle dbus.ObjectPath, app_id string, parent_window string, choices []string, options vmap) (uint32, vmap, *dbus.Error) {
+	cad := ChooseAppData{
+		Handle: handle, Choices: choices, LastChoice: options.get_string("last_choice"),
+		ContentType: options.get_string("content_type"), Filename: options.get_string("filename"), Uri: options.get_string("uri"),
+	}
+	self.lock.Lock()
+	size := self.opts.App_chooser_size
+	self.lock.Unlock()
+	raw, ok := self.run_kitten_in_panel(handle, "app chooser", size, func(output_path, pid_path string) []string {
+		return choose_app_args(cad, output_path, pid_path)
+	})
+	if !ok {
+		return RESPONSE_ENDED, nil, nil
+	}
+	response, results := parse_app_chooser_response(raw, options.get_string("activation_token"))
+	return response, results, nil
+}
+
+// UpdateChoices is called when the list of applications that can open the
+// file changes while the chooser is being shown. The chooser shows all
+// applications anyway, so the update is only logged.
+func (self *Portal) UpdateChoices(handle dbus.ObjectPath, choices []string) *dbus.Error {
+	log.Printf("ignoring update of the choices for the app chooser request %s to: %v", handle, choices)
+	return nil
+}
+
+// }}}

@@ -35,6 +35,7 @@ from .constants import (
     config_dir,
     config_dir_files_ignored,
     is_macos,
+    is_wayland,
     kitten_exe,
     unserialize_launch_flag,
     wakeup_io_loop,
@@ -80,6 +81,7 @@ from .fast_data_types import (
     glfw_get_system_color_theme,
     is_css_pointer_name_valid,
     is_modifier_key,
+    is_os_window_focused,
     last_focused_os_window_id,
     mark_os_window_dirty,
     monotonic,
@@ -89,6 +91,8 @@ from .fast_data_types import (
     pt_to_px,
     remove_timer,
     replace_c0_codes_except_nl_space_tab,
+    run_with_activation_token,
+    seconds_since_last_user_input,
     set_redirect_keys_to_overlay,
     set_window_logo,
     set_window_padding,
@@ -874,6 +878,8 @@ class Window:
         self.last_reported_pty_size = (-1, -1, -1, -1)
         self._pause_resize_notifications_to_child: tuple[int, int, int, int] | None = None
         self.needs_attention = False
+        self.activation_token_request_pending = False
+        self.activation_token_invalid_request_logged = False
         self.ignore_focus_changes = self.initial_ignore_focus_changes
         self.override_title = override_title
         self.default_title = os.path.basename(child.argv[0] or appname)
@@ -1718,6 +1724,90 @@ class Window:
 
     def osc_context(self, ctx_data: memoryview) -> None:
         pass  # this is systemd's useless OSC 3008 context protocol https://systemd.io/OSC_CONTEXT/
+
+    def activation_token_request(self, raw_data: memoryview) -> None:
+        # OSC 5524, see docs/misc-protocol.rst
+        from .activation_token import (
+            MAX_SECONDS_SINCE_INPUT,
+            REPLY_TIMEOUT,
+            InvalidRequest,
+            error_reply,
+            parse_request,
+            query_reply,
+            token_reply,
+        )
+
+        try:
+            req = parse_request(str(raw_data, 'utf-8', 'replace'))
+        except InvalidRequest as e:
+            if not self.activation_token_invalid_request_logged:
+                # log only once, so that programs cannot flood the log
+                self.activation_token_invalid_request_logged = True
+                log_error(f'Ignoring invalid OSC 5524 activation token request: {e}')
+            return
+
+        def send(payload: str) -> None:
+            self.screen.send_escape_code_to_child(ESC_OSC, payload)
+
+        if req.is_query:
+            send(query_reply(req))
+            return
+        if not is_wayland():
+            send(error_reply(req, 'EUNSUPPORTED'))
+            return
+        error = self.activation_token_denial(MAX_SECONDS_SINCE_INPUT)
+        if error:
+            send(error_reply(req, error))
+            return
+        if self.activation_token_request_pending:
+            send(error_reply(req, 'EFAILED'))
+            return
+        self.activation_token_request_pending = True
+        window_id = self.id
+        # Every request gets exactly one reply, the token or an error from the
+        # compositor, or ETIMEDOUT if the compositor does not respond in time,
+        # whichever comes first
+        done = False
+        timer_id = 0
+
+        def finish(reply: str) -> None:
+            nonlocal done
+            if done:
+                return
+            done = True
+            if timer_id:
+                remove_timer(timer_id)
+            w = get_boss().window_id_map.get(window_id)
+            if w is not None:
+                w.activation_token_request_pending = False
+                w.screen.send_escape_code_to_child(ESC_OSC, reply)
+
+        def on_token(token: str) -> None:
+            w = get_boss().window_id_map.get(window_id)
+            # the user might have switched to another window while the
+            # compositor was providing the token
+            error = w.activation_token_denial(MAX_SECONDS_SINCE_INPUT + REPLY_TIMEOUT) if w is not None else 'EFAILED'
+            if error:
+                finish(error_reply(req, error))
+            else:
+                finish(token_reply(req, token) if token else error_reply(req, 'EFAILED'))
+
+        timer_id = add_timer(lambda _: finish(error_reply(req, 'ETIMEDOUT')), REPLY_TIMEOUT, False)
+        if not run_with_activation_token(on_token, self.os_window_id):
+            finish(error_reply(req, 'EFAILED'))
+
+    def activation_token_denial(self, max_seconds_since_input: float) -> str:
+        # A token allows another program to take focus, so only grant it to
+        # the window the user is interacting with: the active window of the
+        # OS window that has keyboard focus, in which the user has recently
+        # pressed a key or mouse button. Returns the error code if not granted.
+        tm = get_boss().os_window_map.get(self.os_window_id)
+        if tm is None or tm.active_window is not self or not is_os_window_focused(self.os_window_id):
+            return 'ENOTFOCUSED'
+        since_input = seconds_since_last_user_input(self.id)
+        if since_input < 0 or since_input > max_seconds_since_input:
+            return 'ENOINPUT'
+        return ''
 
     def program_status_report(self, raw_data: memoryview) -> None:
         # OSC 7501 https://www.superlogical.com/rex/docs/build/program-status

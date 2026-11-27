@@ -34,6 +34,16 @@ opt(
 )
 opt('contrast', 'normal', choices=('normal', 'high'), long_text='The preferred contrast level.')
 opt(
+    'icon_theme',
+    '',
+    long_text="""
+The name of the icon theme for your system, used by programs to find icons, for example: :code:`breeze`. By default,
+the icon theme configured for KDE in :file:`kdeglobals` or for GTK in :file:`settings.ini` is used, if any.
+It can be changed subsequently by using
+:code:`kitten desktop-ui set-setting --namespace org.gnome.desktop.interface icon-theme "'breeze'"`.
+""",
+)
+opt(
     'file_chooser_size',
     '',
     long_text="""
@@ -43,15 +53,24 @@ use this option, depending on the compositor you are running, the popup window m
 """,
 )
 opt(
+    'app_chooser_size',
+    '',
+    long_text="""
+The size in lines and columns of the popup window used to choose applications to open files with. By default it is full screen. For example:
+:code:`app_chooser_size 25 80` will cause the popup to be of size 25 lines and 80 columns. Note that if you
+use this option, depending on the compositor you are running, the popup window may not be properly modal.
+""",
+)
+opt(
     '+file_chooser_kitty_conf',
     '',
-    long_text='Path to config file to use for kitty when drawing the file chooser window. Can be specified multiple times. By default, the'
+    long_text='Path to config file to use for kitty when drawing the file and app chooser windows. Can be specified multiple times. By default, the'
     ' normal kitty.conf is used. Relative paths are resolved with respect to the kitty config directory.',
 )
 opt(
     '+file_chooser_kitty_override',
     '',
-    long_text='Override individual kitty configuration options, for the file chooser window.'
+    long_text='Override individual kitty configuration options, for the file and app chooser windows.'
     ' Can be specified multiple times. Syntax: :italic:`name=value`. For example: :code:`font_size=20`.',
 )
 

@@ -556,9 +556,18 @@ calculate_scrollbar_geometry(const Window *w) {
     return geom;
 }
 
+// Whether the scrollbar is shown or would be shown if the mouse were over it.
+// The area of a scrollbar that cannot be shown, for instance, because the
+// alternate screen is active or the window is not scrolled with the default
+// visibility policy, must not take mouse events from the program.
+static bool
+scrollbar_can_be_shown(const Window *w) {
+    return validate_scrollbar_state(w) && screen_has_scrollbar(w->render_data.screen, true);
+}
+
 static ScrollbarHitType
 get_scrollbar_hit_type(const Window *w, double mouse_x, double mouse_y) {
-    if (!w || !validate_scrollbar_state(w)) return SCROLLBAR_HIT_NONE;
+    if (!w || !scrollbar_can_be_shown(w)) return SCROLLBAR_HIT_NONE;
 
     ScrollbarGeometry geom = calculate_scrollbar_geometry(w);
 
@@ -1278,6 +1287,7 @@ HANDLER(handle_button_event) {
 
     Tab *t = osw->tabs + osw->active_tab;
     bool is_release = !osw->mouse_button_pressed[button];
+    if (!is_release) w->last_user_input_at = monotonic();
     clear_potential_drag(w, button, is_release);
 
     if (handle_scrollbar_mouse(w, button, is_release ? RELEASE : PRESS, modifiers)) return;
