@@ -57,7 +57,8 @@ def get_data(fname: str, folder: str = 'UCD') -> Iterable[str]:
 @lru_cache(maxsize=2)
 def unicode_version() -> tuple[int, int, int]:
     for line in get_data('ReadMe.txt'):
-        m = re.search(r'Version\s+(\d+)\.(\d+)\.(\d+)', line)
+        # The ReadMe of Unicode 18 says version rather than Version
+        m = re.search(r'Version\s+(\d+)\.(\d+)\.(\d+)', line, re.IGNORECASE)
         if m is not None:
             return int(m.group(1)), int(m.group(2)), int(m.group(3))
     raise ValueError('Could not find Unicode Version')
@@ -84,6 +85,8 @@ incb_as_int: dict[str, int] = {}
 int_as_incb: tuple[str, ...] = ()
 incb_map: dict[str, set[int]] = defaultdict(set)
 extended_pictographic: set[int] = set()
+canonical_combining_class: dict[int, int] = {}
+canonical_decomposition: dict[int, tuple[int, ...]] = {}
 
 
 def parse_prop_list() -> None:
@@ -123,6 +126,10 @@ def parse_ucd() -> None:
             for word in name.lower().split():
                 add_word(word, codepoint)
         category = parts[2]
+        if ccc := int(parts[3]):
+            canonical_combining_class[codepoint] = ccc
+        if parts[5] and not parts[5].startswith('<'):
+            canonical_decomposition[codepoint] = tuple(int(x, 16) for x in parts[5].split())
         s = class_maps.setdefault(category, set())
         desc = parts[1]
         codepoints: Union[tuple[int, ...], Iterable[int]] = (codepoint,)
@@ -684,7 +691,6 @@ class GraphemeSegmentationProps(NamedTuple):
 
 
 control_grapheme_breaks = 'CR', 'LF', 'Control'
-linker_or_extend = 'Linker', 'Extend'
 
 
 def bitfield_declaration_as_c(name: str, fields: dict[str, int], *alternate_fields: dict[str, int]) -> str:
@@ -724,12 +730,8 @@ def bitfield_declaration_as_c(name: str, fields: dict[str, int], *alternate_fiel
 
 class GraphemeSegmentationState(NamedTuple):
     grapheme_break: str = ''  # set at runtime
-    # True if the last character ends a sequence of Indic_Conjunct_Break values:  consonant {extend|linker}*
-    incb_consonant_extended: bool = True
-    # True if the last character ends a sequence of Indic_Conjunct_Break values:  consonant {extend|linker}* linker
-    incb_consonant_extended_linker: bool = True
-    # True if the last character ends a sequence of Indic_Conjunct_Break values:  consonant {extend|linker}* linker {extend|linker}*
-    incb_consonant_extended_linker_extended: bool = True
+    # True if the last character ends a sequence of Indic_Conjunct_Break values:  linker extend*
+    incb_linker_extended: bool = True
     # True if the last character ends an emoji modifier sequence \p{Extended_Pictographic} Extend*
     emoji_modifier_sequence: bool = True
     # True if the last character was immediately preceded by an emoji modifier sequence   \p{Extended_Pictographic} Extend*
@@ -737,7 +739,7 @@ class GraphemeSegmentationState(NamedTuple):
 
     @classmethod
     def make(cls) -> 'GraphemeSegmentationState':
-        return GraphemeSegmentationState('AtStart', False, False, False, False, False)
+        return GraphemeSegmentationState('AtStart', False, False, False)
 
     @classmethod
     def fields(cls) -> dict[str, int]:
@@ -786,8 +788,8 @@ class GraphemeSegmentationState(NamedTuple):
             elif prop in ('Extend', 'ZWJ', 'SpacingMark') or prev == 'Prepend':
                 add_to_cell = True
             # No break within certain combinations of Indic_Conjunct_Break values
-            # Between consonant {extend|linker}* linker {extend|linker}* and consonant (GB9c).
-            elif self.incb_consonant_extended_linker_extended and incb == 'Consonant':
+            # Between linker extend* and consonant (GB9c).
+            elif self.incb_linker_extended and incb == 'Consonant':
                 add_to_cell = True
             # No break within emoji modifier sequences or emoji zwj sequences (GB11).
             elif prev == 'ZWJ' and self.emoji_modifier_sequence_before_last_char and p.is_extended_pictographic:
@@ -800,18 +802,14 @@ class GraphemeSegmentationState(NamedTuple):
                     prop = 'Private_Expecting_RI'
             # Break everywhere else GB999
 
-        incb_consonant_extended_linker = self.incb_consonant_extended and incb == 'Linker'
-        incb_consonant_extended_linker_extended = incb_consonant_extended_linker or (self.incb_consonant_extended_linker_extended and incb in linker_or_extend)
-        incb_consonant_extended = incb == 'Consonant' or (self.incb_consonant_extended and incb in linker_or_extend)
+        incb_linker_extended = incb == 'Linker' or (self.incb_linker_extended and incb == 'Extend')
         emoji_modifier_sequence_before_last_char = self.emoji_modifier_sequence
         emoji_modifier_sequence = (self.emoji_modifier_sequence and prop == 'Extend') or p.is_extended_pictographic
 
         return GraphemeSegmentationResult(
             GraphemeSegmentationState(
                 grapheme_break=prop,
-                incb_consonant_extended=incb_consonant_extended,
-                incb_consonant_extended_linker=incb_consonant_extended_linker,
-                incb_consonant_extended_linker_extended=incb_consonant_extended_linker_extended,
+                incb_linker_extended=incb_linker_extended,
                 emoji_modifier_sequence=emoji_modifier_sequence,
                 emoji_modifier_sequence_before_last_char=emoji_modifier_sequence_before_last_char,
             ),
@@ -887,13 +885,15 @@ class GraphemeSegmentationKey(NamedTuple):
         lines: list[str] = []
         a = lines.append
         shift = GraphemeSegmentationProps.used_bits()
+        # The key has the bits of both the state and the char properties
+        key_bits = clamped_bitsize(GraphemeSegmentationState.used_bits() + shift)
         if for_go:
-            base_type = f'uint{GraphemeSegmentationState.bitsize()}'
+            base_type = f'uint{key_bits}'
             a(f'func grapheme_segmentation_key(r GraphemeSegmentationResult, ch CharProps) ({base_type}) {{')
-            a(f'\treturn (r.State() << {shift}) | ch.GraphemeSegmentationProperty()')
+            a(f'\treturn ({base_type}(r.State()) << {shift}) | {base_type}(ch.GraphemeSegmentationProperty())')
             a('}')
         else:
-            base_type = f'uint{GraphemeSegmentationState.bitsize()}_t'
+            base_type = f'uint{key_bits}_t'
             a(f'static inline {base_type} {cls.__name__}(GraphemeSegmentationResult r, CharProps ch){{')
             a(f'\treturn (r.state << {shift}) | ch.grapheme_segmentation_property;')
             a('}')
@@ -991,6 +991,8 @@ class CharProps(NamedTuple):
     is_combining_char: bool = True
     is_word_char: bool = True
     is_punctuation: bool = True
+    # The number of cells a spacing mark adds to the cell it combines into
+    spacing_width: int = 2
 
     # needed for grapheme segmentation set as LSB bits for easy conversion to GraphemeSegmentationProps
     grapheme_break: str = ''  # set at runtime
@@ -1119,6 +1121,43 @@ def patch_declaration(name: str, decl: str, raw: str) -> str:
     return re.sub(rf'{begin}.+?{end}', decl.rstrip(), raw, flags=re.DOTALL)
 
 
+# Code points that are not spacing marks, but widen the cell they combine into like spacing marks do
+spacing_marks_with_width = frozenset((0x0E33, 0x0EB3, 0xFF9E, 0xFF9F))
+
+
+def spacing_widths() -> tuple[dict[int, int], frozenset[int]]:
+    # The spacing width of a spacing mark (category Mc) is the number of spacing
+    # marks with canonical combining class 0 or 9 in its full canonical
+    # decomposition. So two part vowels such as U+0BCA TAMIL VOWEL SIGN O count
+    # as much as the two marks they decompose into, and spacing marks with other
+    # combining classes, the musical symbols, Hangul tone marks and Vietnamese
+    # reading marks that attach to bases with fixed widths, count for nothing.
+    # Also returns the letters whose decompositions contain such marks, which
+    # get a width of two so that their composed and decomposed forms have the
+    # same width.
+    spacing_marks = class_maps['Mc']
+
+    def full_decomposition(ch: int) -> Iterator[int]:
+        if d := canonical_decomposition.get(ch):
+            for x in d:
+                yield from full_decomposition(x)
+        else:
+            yield ch
+
+    def weight(ch: int) -> int:
+        return sum(1 for x in full_decomposition(ch) if x in spacing_marks and canonical_combining_class.get(x, 0) in (0, 9))
+
+    ans = {ch: w for ch in spacing_marks if (w := weight(ch))}
+    if max(ans.values()) > 2:
+        raise SystemExit('A spacing mark has a spacing width of more than two, which does not fit in CharProps.spacing_width')
+    ans.update(dict.fromkeys(spacing_marks_with_width, 1))
+    precomposed = frozenset(ch for ch in canonical_decomposition if ch not in spacing_marks and ch in class_maps['Lo'] and weight(ch))
+    for ch in precomposed:
+        if weight(ch) != 1 or len(canonical_decomposition[ch]) != 2:
+            raise SystemExit(f'The precomposed letter {ch:#x} does not decompose into a letter and one spacing mark')
+    return ans, precomposed
+
+
 def gen_char_props() -> None:
     CharProps._field_defaults['grapheme_break'] = str(bitsize(len(grapheme_segmentation_maps)))
     CharProps._field_defaults['indic_conjunct_break'] = str(bitsize(len(incb_map)))
@@ -1143,9 +1182,11 @@ def gen_char_props() -> None:
         d.update(width_map)
         width_map = d
 
+    spacing_width_map, precomposed_with_spacing_marks = spacing_widths()
     aw(flag_codepoints, 2)
     aw(doublewidth, 2)
     aw(wide_emoji, 2)
+    aw(precomposed_with_spacing_marks, 2)
     aw(marks | {0}, 0)
     aw(non_printing, -1)
     aw(ambiguous, -2)
@@ -1173,6 +1214,7 @@ def gen_char_props() -> None:
             category=cat_map.get(ch, 'Cn'),
             is_word_char=ch in is_word_char,
             is_punctuation=ch in is_punctuation,
+            spacing_width=spacing_width_map.get(ch, 0),
         )
         for ch in range(sys.maxunicode + 1)
     )
@@ -1182,16 +1224,18 @@ def gen_char_props() -> None:
         )
         for x in prop_array
     )
-    # Both kitty's wcswidth() and its text drawing code widen the cell a SpacingMark
-    # with non-zero width combines into. Only these two code points have that
-    # combination (they are Lo not Mc, so they get a width of one), and the
-    # docs/text-sizing-protocol.rst spec says so, hence the assertion.
-    spacing_marks_with_width = frozenset(ch for ch, p in enumerate(prop_array) if p.grapheme_break == 'SpacingMark' and p.width > 0)
-    if spacing_marks_with_width != {0x0E33, 0x0EB3}:
+    # The spacing width rules are specified in docs/text-sizing-protocol.rst, check
+    # that the data still has the structure the spec and the code assume
+    for ch, p in enumerate(prop_array):
+        if p.spacing_width and p.width != (1 if ch in spacing_marks_with_width else 0):
+            raise SystemExit(f'The spacing mark {ch:#x} has the unexpected width {p.width}')
+    zero_weight_spacing_marks = frozenset(ch for ch in class_maps['Mc'] if not spacing_width_map.get(ch))
+    if zero_weight_spacing_marks != frozenset(ch for ch in class_maps['Mc'] if canonical_combining_class.get(ch, 0) not in (0, 9)):
+        raise SystemExit('The spacing marks that add no width are no longer exactly those with a canonical combining class other than 0 or 9')
+    if len(precomposed_with_spacing_marks) != 10:
         raise SystemExit(
-            'The set of non-zero width SpacingMarks has changed to: '
-            f'{sorted(map(hex, spacing_marks_with_width))}. Update screen.c, wcswidth.c,'
-            ' wcswidth.go and docs/text-sizing-protocol.rst to match.'
+            'The set of precomposed letters containing spacing marks has changed to: '
+            f'{sorted(map(hex, precomposed_with_spacing_marks))}. Update docs/text-sizing-protocol.rst to match.'
         )
 
     test_grapheme_segmentation(partial(split_into_graphemes, gsprops))

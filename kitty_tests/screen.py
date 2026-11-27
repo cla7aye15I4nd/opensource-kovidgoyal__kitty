@@ -5,7 +5,19 @@ import os
 import re
 import tempfile
 
-from kitty.fast_data_types import DECAWM, DECCOLM, DECOM, IRM, SCROLL_LINE, VT_PARSER_BUFFER_SIZE, Color, ColorProfile, Cursor, test_set_batched_non_ascii_draw
+from kitty.fast_data_types import (
+    DECAWM,
+    DECCOLM,
+    DECOM,
+    IRM,
+    SCROLL_LINE,
+    VT_PARSER_BUFFER_SIZE,
+    Color,
+    ColorProfile,
+    Cursor,
+    test_set_batched_non_ascii_draw,
+    wcswidth,
+)
 from kitty.marks import marker_from_function, marker_from_regex, marker_from_text
 from kitty.utils import path_from_osc7_url
 from kitty.window import is_conemu_osc9_command, pagerhist
@@ -104,6 +116,15 @@ class TestScreen(BaseTest):
         s.draw('ab')
         self.ae(str(s.line(4)), 'ab123')
         self.ae((s.cursor.x, s.cursor.y), (2, 4))
+
+    def test_bell_callback_resizing_screen_while_drawing(self):
+        # The bell callback runs Python code that can resize the screen in the
+        # middle of drawing a run of text, which frees the line buffers being drawn into
+        s = self.create_screen(cols=10, lines=5)
+        s.callbacks.on_bell = lambda: s.resize(3, 20)
+        parse_bytes(s, b'abc\x07def')
+        self.ae(str(s.line(s.cursor.y)), 'abcdef')
+        self.ae(s.cursor.x, 6)
 
     def test_draw_batched_ascii_run(self):
         # The batched fast path for runs of printable ASCII in draw_text_loop
@@ -1007,6 +1028,15 @@ class TestScreen(BaseTest):
             '\u0300\ufe0f\u0301',
             '👍\u0300\u200d',
             'ก\u0e33\u0300',
+            # spacing marks, which widen the cell they are added to
+            '\u0915\u093f',
+            '\u0937\u0903\u0903',
+            '\u0b9f\u0bca',
+            '\u0b9f\u0bc6\u0bbe',
+            '\u1000\u1031\u102c',
+            '\u0995\u09cb\u0982',
+            '\u093f\u0300\u0903',
+            '\u0937' + '\u0903' * 6,
         )
 
         def ops_for(seed, cols):
@@ -2051,7 +2081,7 @@ class TestScreen(BaseTest):
 
     def test_explicit_width_is_not_changed_by_combining_chars(self):
         # A width set explicitly via the text sizing protocol wins over the implicit
-        # re-sizing done by the variation selectors and Thai/Lao SARA AM
+        # re-sizing done by the variation selectors and spacing marks
         def mcd(text, width, follow):
             s = self.create_screen(cols=8)
             draw_multicell(s, text, width=width)
@@ -2069,10 +2099,14 @@ class TestScreen(BaseTest):
         s, c = mcd('\u26d4', 1, '\ufe0f')
         self.ae(c['width'], 1)
         self.ae(s.cursor.x, 1)
-        # SARA AM must not widen an explicitly narrowed cell
-        s, c = mcd('\u0e08', 1, '\u0e33')
-        self.ae(c['width'], 1)
-        self.ae(s.cursor.x, 1)
+        # spacing marks must not widen an explicitly narrowed cell
+        for base, mark in (('\u0e08', '\u0e33'), ('\u0915', '\u093f'), ('\u0b9f', '\u0bca')):
+            s, c = mcd(base, 1, mark)
+            self.ae(c['width'], 1)
+            self.ae(s.cursor.x, 1)
+        # nor an explicitly widened one
+        s, c = mcd('\u0915', 2, '\u093f')
+        self.ae((c['width'], s.cursor.x), (2, 2))
 
         # and the natural width cases still re-size, so the tests above are meaningful
         s = self.create_screen(cols=8)
@@ -2088,37 +2122,154 @@ class TestScreen(BaseTest):
         s.draw('\u0e08\u0e33')
         self.ae(s.cursor.x, 4)
 
-    def test_spacing_mark_widens_narrow_cell(self):
-        # Thai SARA AM and Lao AM are SpacingMarks with width 1 that widen the cell they combine into
-        s = self.create_screen(cols=5)
-        s.draw('จำ')
-        self.ae(s.cursor.x, 2)
-        self.assertTrue(str(s.line(0)).startswith('จำ'))
-        c = s.cpu_cells(0, 0)
-        self.assertTrue(c['mcd'])
-        self.ae(c['mcd']['width'], 2)
-        self.ae(c['x'], 0)
-        self.ae(s.cpu_cells(0, 1)['x'], 1)
-        s.reset()
-        s.draw('จ')
-        self.ae(s.cursor.x, 1)
-        s.draw('ำ')
-        self.ae(s.cursor.x, 2)
-        s.reset()
-        s.draw('จำำ')
-        self.ae(s.cursor.x, 2)
-        s.reset()
-        s.draw('ກຳ')
-        self.ae(s.cursor.x, 2)
-        s.reset()
-        s.draw('กิ')
-        self.ae(s.cursor.x, 1)
-        # widened char on the last column wraps onto the next line
+    def test_spacing_marks_widen_cells(self):
+        # Spacing marks widen the cell they are added to, up to four cells, see
+        # the Spacing marks section of docs/text-sizing-protocol.rst
+        cases = (
+            # text, width, text in the line
+            ('\u0e08\u0e33', 2, None),  # Thai SARA AM
+            ('\u0e08\u0e33\u0e33', 3, None),
+            ('\u0e81\u0eb3', 2, None),  # Lao AM
+            ('\u0e01\u0e34', 1, None),  # a nonspacing mark adds no width
+            ('\u0915\u093f', 2, None),  # Devanagari vowel sign I
+            ('\u0937\u0903\u0903', 3, None),  # two visargas
+            ('\u0b95\u0bbe', 2, None),  # Tamil AA has Grapheme_Cluster_Break=Extend
+            ('\u0b9f\u0bca', 3, None),  # Tamil O, a two part vowel
+            ('\u0b9f\u0bc6\u0bbe', 3, None),  # and its decomposed form
+            ('\u1000\u1031\u102c', 3, None),  # Myanmar AA follows a grapheme break
+            ('\u0995\u09cb\u0982', 4, None),  # Bengali: two part vowel and anusvara
+            ('\u0937' + '\u0903' * 6, 4, None),  # capped at four
+            ('\uff76\uff9e', 2, None),  # halfwidth katakana voiced sound mark
+            ('\u0b94', 2, None),  # a letter that decomposes into a letter and a spacing mark
+            ('\U0001d158\U0001d165\U0001d16e', 1, None),  # combining classes other than 0 and 9 add no width
+            ('\uac00\u302e', 2, None),
+            ('\U0001f600\u093e', 3, None),  # regardless of the base
+            ('\u4e00\u093f', 3, None),
+            ('\u0915\u0903\ufe0f', 2, None),  # VS16 after a spacing mark has no effect
+            ('\u231a\ufe0e\u093e', 2, None),  # a spacing mark after VS15 widens the narrowed emoji
+            ('\u093f', 1, None),  # a spacing mark with no previous cell is in a cell of its own
+            ('\u0bca', 2, None),
+            ('\u094d\u0903', 1, '\u0903'),  # the leading nonspacing mark is discarded
+        )
+        for batched in (True, False):
+            test_set_batched_non_ascii_draw(batched)
+            try:
+                for text, width, line_text in cases:
+                    for split in (False, True):
+                        s = self.create_screen(cols=10)
+                        if split:
+                            for ch in text:
+                                s.draw(ch)
+                        else:
+                            s.draw(text)
+                        msg = f'{text!r} split: {split} batched: {batched}'
+                        self.ae((s.cursor.x, s.cursor.y), (width, 0), msg)
+                        self.ae(wcswidth(text), width, msg)
+                        self.ae(str(s.line(0)), line_text or text, msg)
+                        if width > 1:
+                            for x in range(width):
+                                c = s.cpu_cells(0, x)
+                                self.ae((c['mcd']['width'], c['x'], c['mcd']['natural_width']), (width, x, True), msg)
+            finally:
+                test_set_batched_non_ascii_draw(True)
+
+        # a widened char that no longer fits in its line moves onto the next line
+        for split in (False, True):
+            s = self.create_screen(cols=3)
+            if split:
+                s.draw('a\u0995'), s.draw('\u09cb')
+            else:
+                s.draw('a\u0995\u09cb')
+            self.ae((s.cursor.x, s.cursor.y), (3, 1))
+            self.ae(str(s.line(0)), 'a')
+            self.ae(str(s.line(1)), '\u0995\u09cb')
+            self.assertTrue(s.cpu_cells(0, 2)['next_char_was_wrapped'])
         s = self.create_screen(cols=2)
-        s.draw('aจำ')
+        s.draw('a\u0e08\u0e33')
         self.ae((s.cursor.x, s.cursor.y), (2, 1))
         self.ae(str(s.line(0)), 'a')
-        self.ae(str(s.line(1)), 'จำ')
+        self.ae(str(s.line(1)), '\u0e08\u0e33')
+        # one that fits exactly stays
+        s = self.create_screen(cols=4)
+        s.draw('ab\u0995\u093f')
+        self.ae((s.cursor.x, s.cursor.y), (4, 0))
+        self.ae(str(s.line(0)), 'ab\u0995\u093f')
+        # one wider than the screen is discarded, as a wide char that is too wide is
+        s = self.create_screen(cols=3)
+        s.draw('\u0995\u09cb\u0982')
+        self.ae(str(s.line(0)), '')
+        self.ae(str(s.line(1)), '')
+
+        # widening replaces the chars in the cells it widens into
+        s = self.create_screen(cols=10)
+        s.draw('\u0995\u4e00b')
+        s.cursor.x = 1
+        s.draw('\u09cb')
+        self.ae(s.cursor.x, 3)
+        self.ae(str(s.line(0)), '\u0995\u09cbb')
+        self.ae(s.cpu_cells(0, 3)['text'], 'b')
+        # but moves past the lower rows of multiline chars
+        s = self.create_screen(cols=10)
+        s.draw('a')
+        draw_multicell(s, 'X', scale=2)
+        s.cursor.x, s.cursor.y = 0, 1
+        s.draw('\u0995\u09cb')
+        self.ae((s.cursor.x, s.cursor.y), (6, 1))
+        self.ae(s.cpu_cells(1, 1)['y'], 1)
+        self.ae((s.cpu_cells(1, 0)['text'], s.cpu_cells(1, 3)['text'], s.cpu_cells(1, 3)['mcd']['width']), ('', '\u0995\u09cb', 3))
+
+        # scaled chars are not widened, but their natural width includes spacing marks
+        s = self.create_screen(cols=10)
+        draw_multicell(s, '\u0915', scale=2)
+        s.draw('\u093f')
+        self.ae((s.cursor.x, s.cpu_cells(0, 0)['mcd']['width']), (2, 1))
+        s = self.create_screen(cols=10)
+        draw_multicell(s, '\u0995\u09cb', scale=2)
+        self.ae((s.cursor.x, s.cpu_cells(0, 0)['mcd']['width']), (6, 3))
+        s = self.create_screen(cols=10)
+        draw_multicell(s, '\u093f')
+        self.ae((s.cursor.x, str(s.line(0))), (1, '\u093f'))
+
+        # a spacing mark after a cell without text is in a cell of its own
+        for mark, width in (('\u093f', 1), ('\u0bca', 2), ('\u0e33', 1)):
+            s = self.create_screen(cols=10)
+            s.cursor_position(1, 5)
+            s.draw(mark)
+            self.ae((s.cursor.x, s.cpu_cells(0, 4)['text']), (4 + width, mark), repr(mark))
+        # also after nonspacing marks, which are dropped as they have no cell to be added to
+        for batched in (True, False):
+            test_set_batched_non_ascii_draw(batched)
+            try:
+                s = self.create_screen(cols=10)
+                s.cursor_position(1, 3)
+                s.draw('\u0302\u0300\u0bbe')
+                self.ae((s.cursor.x, s.cpu_cells(0, 2)['text']), (3, '\u0bbe'), f'batched: {batched}')
+            finally:
+                test_set_batched_non_ascii_draw(True)
+        # a char widened to more than the width of the screen is discarded
+        # without affecting the chars before it or moving the cursor back
+        s = self.create_screen(cols=2)
+        s.draw('x\u0995\u09cb\u0982')
+        self.ae((s.cpu_cells(0, 0)['text'], s.cpu_cells(0, 0)['mcd']), ('x', None))
+        self.ae(str(s.line(0)), 'x')
+        self.ae(str(s.line(1)), '\u0982')
+        s = self.create_screen(cols=3)
+        s.draw('ab\u0995')
+        self.ae((s.cursor.x, s.cursor.y), (3, 0))
+        s.draw('\u09cb\u0982')
+        self.ae(str(s.line(0)), 'ab')
+        self.ae(s.cpu_cells(0, 1)['mcd'], None)
+
+        # rewrapping keeps a widened char whole
+        s = self.create_screen(cols=10, lines=5)
+        s.draw('abcdefgh\u0995\u09cb\u0982')
+        self.ae(str(s.line(1)), '\u0995\u09cb\u0982')
+        s.resize(5, 20)
+        self.ae(str(s.line(0)), 'abcdefgh\u0995\u09cb\u0982')
+        self.ae(s.cpu_cells(0, 8)['mcd']['width'], 4)
+        s.resize(5, 11)
+        self.ae(str(s.line(0)), 'abcdefgh')
+        self.ae(str(s.line(1)), '\u0995\u09cb\u0982')
 
     def test_writing_with_cursor_on_trailer_of_wide_character(self):
         s = self.create_screen()
@@ -2285,6 +2436,16 @@ class TestScreen(BaseTest):
         self.ae(contents(), text)
         s.historybuf.pagerhist_rewrap(2)
         self.ae(contents(), '\x1b[mso\rft\x1b[m\rbr\rea\rk\nne\rxt\r😼\rca\rt')
+        # a spacing mark is never wrapped away from the cell it is added to
+        for text, expected in (
+            ('ab\u0915\u093f', 'ab\u0915\u093f'),
+            ('abc\u0915\u093f', 'abc\r\u0915\u093f'),
+            ('ab\u1000\u1031\u102c', 'ab\u1000\u1031\u102c'),
+        ):
+            s = self.create_screen(options={'scrollback_pager_history_size': 2048})
+            w(text)
+            s.historybuf.pagerhist_rewrap(3)
+            self.ae(contents(), expected)
 
         s = self.create_screen(options={'scrollback_pager_history_size': 8})
         w('😼')

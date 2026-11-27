@@ -266,6 +266,25 @@ Detailed list of changes
 - A new option :opt:`ime_preedit_style` to control how the pre-edit text of
   input methods and dictation is styled (:iss:`10739`)
 
+- Unicode: Spacing combining marks, such as the vowel signs of Indic scripts
+  and Myanmar, now widen the cell they combine into, up to four cells, instead
+  of being squeezed into the width of the first character of the grapheme.
+  This matches the widths wcwidth() based programs, such as shells, readline
+  and tmux, compute for most text and gives these scripts room to render. The
+  halfwidth katakana voiced sound marks also widen the cell they combine into.
+  See :ref:`spacing_marks` for details (:iss:`8533`)
+
+- Add support for Unicode 18
+
+- Fix a crash when pressing a key immediately after clicking a hyperlink that
+  opens an overlay window (:iss:`10953`)
+
+- Fix crashes in rare cases when a mouse mapping, scroll mapping, watcher or
+  bell handler creates or resizes windows while kitty is processing an event
+
+- Fix screenshots and thumbnails no longer working after two were requested
+  at the same time
+
 0.51.1 [2026-11-23]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

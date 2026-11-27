@@ -9,13 +9,14 @@
 
 #include "data-types.h"
 
-// CharPropsDeclaration: uses 23 bits {{{
+// CharPropsDeclaration: uses 25 bits {{{
 typedef union CharProps {
     struct __attribute__((packed)) {
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
         uint8_t is_extended_pictographic : 1;
         uint8_t indic_conjunct_break : 2;
         uint8_t grapheme_break : 4;
+        uint8_t spacing_width : 2;
         uint8_t is_punctuation : 1;
         uint8_t is_word_char : 1;
         uint8_t is_combining_char : 1;
@@ -26,9 +27,9 @@ typedef union CharProps {
         uint8_t category : 5;
         uint8_t is_emoji : 1;
         uint8_t shifted_width : 3;
-        uint16_t : 9;
+        uint8_t : 7;
 #elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-        uint16_t : 9;
+        uint8_t : 7;
         uint8_t shifted_width : 3;
         uint8_t is_emoji : 1;
         uint8_t category : 5;
@@ -39,6 +40,7 @@ typedef union CharProps {
         uint8_t is_combining_char : 1;
         uint8_t is_word_char : 1;
         uint8_t is_punctuation : 1;
+        uint8_t spacing_width : 2;
         uint8_t grapheme_break : 4;
         uint8_t indic_conjunct_break : 2;
         uint8_t is_extended_pictographic : 1;
@@ -62,25 +64,19 @@ typedef union CharProps {
 static_assert(sizeof(CharProps) == sizeof(uint32_t), "Fix the ordering of CharProps");
 // EndCharPropsDeclaration }}}
 
-// GraphemeSegmentationResultDeclaration: uses 10 bits {{{
+// GraphemeSegmentationResultDeclaration: uses 8 bits {{{
 typedef union GraphemeSegmentationResult {
     struct __attribute__((packed)) {
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
         uint8_t emoji_modifier_sequence_before_last_char : 1;
         uint8_t emoji_modifier_sequence : 1;
-        uint8_t incb_consonant_extended_linker_extended : 1;
-        uint8_t incb_consonant_extended_linker : 1;
-        uint8_t incb_consonant_extended : 1;
+        uint8_t incb_linker_extended : 1;
         uint8_t grapheme_break : 4;
         uint8_t add_to_current_cell : 1;
-        uint8_t : 6;
 #elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-        uint8_t : 6;
         uint8_t add_to_current_cell : 1;
         uint8_t grapheme_break : 4;
-        uint8_t incb_consonant_extended : 1;
-        uint8_t incb_consonant_extended_linker : 1;
-        uint8_t incb_consonant_extended_linker_extended : 1;
+        uint8_t incb_linker_extended : 1;
         uint8_t emoji_modifier_sequence : 1;
         uint8_t emoji_modifier_sequence_before_last_char : 1;
 #else
@@ -89,18 +85,18 @@ typedef union GraphemeSegmentationResult {
     };
     struct __attribute__((packed)) {
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-        uint16_t state : 9;
-        uint8_t : 7;
+        uint8_t state : 7;
+        uint8_t : 1;
 #elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-        uint8_t : 7;
-        uint16_t state : 9;
+        uint8_t : 1;
+        uint8_t state : 7;
 #else
 #error "Unsupported endianness"
 #endif
     };
-    uint16_t val;
+    uint8_t val;
 } GraphemeSegmentationResult;
-static_assert(sizeof(GraphemeSegmentationResult) == sizeof(uint16_t), "Fix the ordering of GraphemeSegmentationResult");
+static_assert(sizeof(GraphemeSegmentationResult) == sizeof(uint8_t), "Fix the ordering of GraphemeSegmentationResult");
 // EndGraphemeSegmentationResultDeclaration }}}
 
 // UCBDeclaration {{{
@@ -177,6 +173,25 @@ void init_char_props(void);
 static inline int
 wcwidth_std(CharProps ch) {
     return (int)ch.shifted_width - 4 /*=width_shift*/;
+}
+
+// The maximum width in cells that spacing marks can widen a cell to, see the
+// Spacing marks section of docs/text-sizing-protocol.rst
+#define MAX_SPACING_MARK_CELL_WIDTH 4u
+
+static inline unsigned
+cell_width_with_spacing_width(unsigned cell_width, unsigned spacing_width) {
+    // The width of a cell of width cell_width after spacing marks with a total
+    // spacing width of spacing_width are added to it. A cell of width zero means
+    // there is no previous cell, so the marks are in a cell of their own.
+    if (cell_width >= MAX_SPACING_MARK_CELL_WIDTH) return cell_width;
+    const unsigned w = cell_width + spacing_width;
+    return w > MAX_SPACING_MARK_CELL_WIDTH ? MAX_SPACING_MARK_CELL_WIDTH : w;
+}
+
+static inline unsigned
+cell_width_with_spacing_mark(unsigned cell_width, CharProps spacing_mark) {
+    return cell_width_with_spacing_width(cell_width, spacing_mark.spacing_width);
 }
 static inline bool
 is_private_use(CharProps ch) {

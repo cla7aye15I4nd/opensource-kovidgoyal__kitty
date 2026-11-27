@@ -34,26 +34,51 @@ wcswidth_step(WCSState *state, const char_type ch) {
 
         case NORMAL: {
             CharProps cp = char_props_for(ch);
+            state->last_combined = false;
+            if (cp.is_invalid) {
+                // As in the terminal, invalid chars, which include control chars, are
+                // ignored, except for the ones that move the cursor, after which there
+                // is no previous cell to combine with
+                switch (ch) {
+                    case 0x1b: state->parser_state = IN_ESC; /* fallthrough */
+                    case '\b':
+                    case '\t':
+                    case '\n':
+                    case '\v':
+                    case '\f':
+                    case '\r':
+                        state->prev_width = 0;
+                        state->can_combine = false;
+                        grapheme_segmentation_reset(&state->seg);
+                        state->prev_ch = ch;
+                        break;
+                }
+                return 0;
+            }
             state->seg = grapheme_segmentation_step(state->seg, cp);
             if (state->seg.add_to_current_cell && state->can_combine) {
+                state->last_combined = true;
                 switch (ch) {
+                    // A variation selector that does not apply leaves the width of the cell unchanged
                     case 0xfe0f:
                         if (char_props_for(state->prev_ch).is_emoji_presentation_base && state->prev_width == 1) {
                             ans = 1;
                             state->prev_width = 2;
-                        } else state->prev_width = 0;
+                        }
                         break;
                     case 0xfe0e:
                         if (char_props_for(state->prev_ch).is_emoji_presentation_base && state->prev_width == 2) {
                             ans = -1;
                             state->prev_width = 1;
-                        } else state->prev_width = 0;
+                        }
                         break;
                     default:
-                        // Thai/Lao SARA AM: a SpacingMark with non-zero width widens a narrow base cell
-                        if (cp.grapheme_break == GBP_SpacingMark && wcwidth_std(cp) > 0 && state->prev_width == 1) {
-                            ans = 1;
-                            state->prev_width = 2;
+                        if (cp.spacing_width) {
+                            // A spacing mark widens the cell it is added to, or is in a cell of its
+                            // own when there is no previous cell
+                            const int w = cell_width_with_spacing_mark(state->prev_width, cp);
+                            ans = w - state->prev_width;
+                            state->prev_width = w;
                         }
                         break;
                 }
@@ -61,11 +86,18 @@ wcswidth_step(WCSState *state, const char_type ch) {
             }
             int width = wcwidth_std(cp);
             switch (width) {
-                case -1:
                 case 0:
-                    state->prev_width = 0;
-                    if (ch == 0x1b) state->parser_state = IN_ESC;
-                    break;
+                    // A zero width char after a grapheme boundary is added to the previous cell, if there is
+                    // one, otherwise it is discarded, unless it is a spacing mark, which is then in a cell of its own
+                    state->last_combined = state->can_combine;
+                    if (cp.spacing_width) {
+                        const int w = cell_width_with_spacing_mark(state->can_combine ? state->prev_width : 0, cp);
+                        ans = state->can_combine ? w - state->prev_width : w;
+                        state->prev_width = w;
+                    } else if (!state->can_combine) state->prev_width = 0;
+                    state->can_combine = true;
+                    state->prev_ch = ch;
+                    return ans;
                 case 2: state->prev_width = 2; break;
                 default: state->prev_width = 1; break;
             }
