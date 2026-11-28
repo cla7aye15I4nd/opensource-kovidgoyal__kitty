@@ -42,7 +42,9 @@ go_type_map = {
 
 
 class GoOption:
-    def __init__(self, x: OptionDefinition) -> None:
+    def __init__(self, x: OptionDefinition, group: str = '') -> None:
+        # the title of the group of options this option belongs to, if any
+        self.group = group
         flags = sorted(x.aliases, key=len)
         short = ''
         self.aliases = []
@@ -126,9 +128,12 @@ class GoOption:
 
 
 def go_options_for_seq(seq: 'OptionSpecSeq') -> Iterator[GoOption]:
+    group = ''
     for x in seq:
-        if not isinstance(x, str):
-            yield GoOption(x)
+        if isinstance(x, str):
+            group = x
+        else:
+            yield GoOption(x, group)
 
 
 def surround(x: str, start: int, end: int) -> str:
@@ -535,6 +540,10 @@ def seq_as_rst(seq: OptionSpecSeq, usage: str | None, message: str | None, appna
             t = t.replace('#placeholder_for_formatting#', '')
             a('')
             a(textwrap.indent(prettify_rst(t), ' ' * 4))
+            if (defval is not None or opt.choices) and t.splitlines()[-1][:1].isspace():
+                # help text ends with an indented block such as a definition
+                # list, a blank line is needed before the following paragraph
+                a('')
             if defval is not None:
                 a(textwrap.indent(f'Default: :code:`{escape_rst(str(defval))}`', ' ' * 4))
             if opt.choices:

@@ -692,6 +692,51 @@ class Rendering(FontBaseTest):
             self.ae([line.sprite_at(x) for x in range(s.columns)], [0] * s.columns)
             s.cursor_position(1, 1)
 
+    def test_render_parts_of_multicell_chars(self):
+        # The cells of a part of a multicell char, drawn with the x, y, c and r
+        # keys of the text sizing protocol, are rendered as those cells of the
+        # complete char, wherever they are drawn, whether or not the complete
+        # char was rendered before
+        def sprites(s, y):
+            line = s.line(y)
+            test_render_line(line)
+            return [line.sprite_at(x) for x in range(s.columns)]
+
+        for ch, width, scale in (('P', 1, 2), ('猫', 2, 1), ('Q', 2, 2), ('R', 3, 1)):
+            cols = width * scale
+            for x0 in range(cols):
+                for y0 in range(scale):
+                    parts = self.create_screen(cols=10, lines=scale, scrollback=0)
+                    parts.draw('ab')
+                    parts.cursor_position(1, 4)
+                    draw_multicell(parts, ch, width=width, scale=scale, part=(x0, y0, 1, 1))
+                    parts.draw('cd')
+                    got = sprites(parts, 0)
+                    whole = self.create_screen(cols=10, lines=scale, scrollback=0)
+                    whole.draw('ab')
+                    whole.cursor_position(1, 4)
+                    draw_multicell(whole, ch, width=width, scale=scale)
+                    whole.draw('cd')
+                    self.ae(got[3], sprites(whole, y0)[3 + x0], (ch, x0, y0))
+                    # the cells around the part are not affected by it
+                    whole_top = sprites(whole, 0)
+                    self.ae(got[:2], whole_top[:2])
+                    if scale == 1:
+                        self.ae(got[4:6], whole_top[3 + cols : 5 + cols])
+
+    def test_render_many_split_multicell_chars(self):
+        # Lines can have any number of split chars, more than are collected while rendering the runs
+        s = self.create_screen(cols=50, lines=1, scrollback=0)
+        for i in range(24):
+            draw_multicell(s, '猫', width=2, part=(i % 2, 0, 1, 0))
+            s.draw('x')
+        line = s.line(0)
+        test_render_line(line)
+        sprites = [line.sprite_at(x) for x in range(0, 48, 2)]
+        ae = self.ae
+        ae(sprites[:2] * 12, sprites)
+        self.assertNotIn(0, sprites)
+
     def test_render_line_with_split_multicell_chars(self):
         # A horizontally scrolled smooth scroll region can split wide chars,
         # leaving some of their cells in a line without the others. These
@@ -1649,6 +1694,31 @@ class BidiLigatureRendering(BidiRenderingBase):
             with self.subTest(strategy=strategy, cursor_x=cursor_x):
                 sprites = self.screen_sprites(text, strategy, cursor_x)
                 self.ae(sprites[2:4] != [single, single], ligated)
+
+    def test_ligatures_at_cursor_in_multiline_chars(self):
+        # Ligatures are disabled in the rows of the char under the cursor
+        # that are present, a part of a char is not under the cursor when the
+        # row above it is not part of the char
+        def sprites(setup, strategy, cursor):
+            s = self.create_screen(cols=8, lines=3, scrollback=0)
+            s.disable_ligatures = strategy
+            parse_bytes(s, setup)
+            s.cursor.x, s.cursor.y = cursor
+            s.test_update_cell_data(self.font_size, self.dpi, self.dpi)
+            return [
+                [bytes(self.sprites[sprite_idx_to_pos(s.line(y).sprite_at(x), setup_for_testing.xnum, setup_for_testing.ynum)]) for x in range(1, 5)]
+                for y in range(3)
+            ]
+
+        complete = b'\x1b[1;2H\x1b]66;s=2:w=2;==\x07'
+        part = b'\x1b[2;2H\x1b]66;s=2:w=2:y=1;==\x07'
+        ae = self.ae
+        # the cursor on the bottom row of a complete char
+        self.assertNotEqual(sprites(complete, 'never', (2, 1))[0], sprites(complete, 'always', (2, 1))[0])
+        ae(sprites(complete, 'cursor', (2, 1))[:2], sprites(complete, 'always', (2, 1))[:2])
+        # the cursor above a part, on a row that is not part of the char
+        ae(sprites(part, 'cursor', (2, 0))[1], sprites(part, 'never', (2, 0))[1])
+        ae(sprites(part, 'cursor', (2, 1))[1], sprites(part, 'always', (2, 1))[1])
 
 
 def test_chars(chars: str = '╌', sz: int = 128) -> None:

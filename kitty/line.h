@@ -147,6 +147,8 @@ typedef struct {
 
 typedef struct MultiCellCommand {
     unsigned int width, scale, subscale_n, subscale_d, vertical_align, horizontal_align;
+    // The part of the block of the char to draw, see the "Drawing part of a character" section of docs/text-sizing-protocol.rst
+    unsigned int part_x, part_y, part_columns, part_rows;
     size_t payload_sz;
 } MultiCellCommand;
 
@@ -159,6 +161,23 @@ typedef struct ANSILineOutput {
     // The bidi record of the paragraph being written, see ansi_bidi_row_start(), 0 when none is open, and the record whose
     // controls line_as_ansi() is to write before the text of the next line it writes
     uint8_t bidi_open, bidi_prefix;
+    // The rows around the line being written, used to write the multiline
+    // chars of which only some rows are present, see line_as_ansi(). Sets
+    // *cells to the cells of the row dy rows below the line, above it for
+    // negative dy, or to NULL when there is no such row. Returns false when
+    // the row is not known, multiline chars are then assumed to continue into
+    // it. When NULL, no rows are known.
+    bool (*neighbour_row)(void *ctx, int dy, const CPUCell **cells);
+    void *neighbour_row_ctx;
+    // The columns [skipped_start, skipped_limit) of the cells just before the
+    // current one that were not written, as they continue multiline chars
+    // written with the rows above, skipped_limit is zero when there are none
+    index_type skipped_start, skipped_limit;
+    // Whether the cells not written run to the end of the previous line,
+    // which continues on this one, and whether that line was such a line
+    bool skipped_before_line, skipped_to_end_of_continued_line;
+    // Whether the previous line continues on this one and whether text was written for a cell of this line
+    bool previous_line_continued, wrote_text;
 } ANSILineState;
 
 static inline void
@@ -224,14 +243,14 @@ continues_multicell_char(const CPUCell *c, const CPUCell *ref, index_type y) {
     // Use this rather than trusting the y and scale of a cell when walking the rows of a
     // multiline char, as the char may be partial or torn.
     return c->is_multicell && c->y == y && c->x == ref->x && c->scale == ref->scale && c->width == ref->width && c->subscale_n == ref->subscale_n &&
-           c->subscale_d == ref->subscale_d && c->ch_and_idx == ref->ch_and_idx;
+           c->subscale_d == ref->subscale_d && c->valign == ref->valign && c->halign == ref->halign && c->ch_and_idx == ref->ch_and_idx;
 }
 
 static inline bool
 continues_multicell_char_horizontally(const CPUCell *c, const CPUCell *ref, index_type x) {
     // Whether c is the cell in column x of the same multicell char as ref in the same row.
     return c->is_multicell && c->x == x && c->y == ref->y && c->scale == ref->scale && c->width == ref->width && c->subscale_n == ref->subscale_n &&
-           c->subscale_d == ref->subscale_d && c->ch_and_idx == ref->ch_and_idx;
+           c->subscale_d == ref->subscale_d && c->valign == ref->valign && c->halign == ref->halign && c->ch_and_idx == ref->ch_and_idx;
 }
 
 typedef struct MulticellColumns {

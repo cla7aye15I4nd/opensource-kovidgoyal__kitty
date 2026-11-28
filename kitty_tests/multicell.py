@@ -140,25 +140,691 @@ class TestMulticell(BaseTest):
                 self.ae(c['y'], y, f'cols: {cols}')
             self.ae(str(s.line(0)), 'A' if cols == 3 else 'AX')
 
+    def test_multicell_parts(self):
+        # Drawing part of the block of a multicell char, see the "Drawing part
+        # of a character" section of docs/text-sizing-protocol.rst
+        ae = self.ae
+
+        def cells(s, y, xs):
+            ans = []
+            for x in xs:
+                c = s.cpu_cells(y, x)
+                ans.append(None if c['mcd'] is None else (c['x'], c['y'], c['mcd']['scale'], c['mcd']['width']))
+            return ans
+
+        def draw_at(s, y, x, *a, **kw):
+            s.cursor_position(y + 1, x + 1)
+            multicell(s, *a, **kw)
+
+        # the bottom row of a double sized char, in the cursor row
+        s = self.create_screen(cols=6, lines=3)
+        s.cursor_position(2, 2)
+        s.draw('ab')
+        draw_at(s, 1, 1, 'A', width=1, scale=2, part=(0, 1, 0, 1))
+        ae((s.cursor.x, s.cursor.y), (3, 1))
+        ae(cells(s, 1, range(1, 3)), [(0, 1, 2, 1), (1, 1, 2, 1)])
+        ae(cells(s, 0, range(1, 3)), [None, None])
+        ae(cells(s, 2, range(1, 3)), [None, None])
+        # the right column of the top right quarter of a triple sized wide char
+        s = self.create_screen(cols=8, lines=4)
+        draw_at(s, 0, 2, '好', width=2, scale=3, part=(4, 0, 2, 2))
+        ae((s.cursor.x, s.cursor.y), (4, 0))
+        for y in (0, 1):
+            ae(cells(s, y, range(1, 5)), [None, (4, y, 3, 2), (5, y, 3, 2), None])
+        ae(cells(s, 2, range(2, 4)), [None, None])
+        # one cell of a wide char
+        s = self.create_screen(cols=4, lines=2)
+        multicell(s, '好', width=2, part=(1, 0, 1, 0))
+        ae((s.cursor.x, cells(s, 0, range(2))), (1, [(1, 0, 1, 2), None]))
+        # a part with no rows below the cursor fits without scrolling the screen
+        s = self.create_screen(cols=4, lines=2, scrollback=5)
+        draw_at(s, 1, 0, 'A', width=1, scale=2, part=(0, 0, 0, 1))
+        ae((s.historybuf.count, cells(s, 1, range(2))), (0, [(0, 0, 2, 1), (1, 0, 2, 1)]))
+        # a part wrapped onto the next line as a char of its width
+        s = self.create_screen(cols=4, lines=3)
+        draw_at(s, 0, 3, 'A', width=1, scale=2, part=(0, 0, 2, 1))
+        ae((s.cursor.x, s.cursor.y), (2, 1))
+        ae(cells(s, 1, range(2)), [(0, 0, 2, 1), (1, 0, 2, 1)])
+
+        # invalid parts are ignored
+        for kw in (
+            dict(part=(1, 0, 0, 0)),  # no width
+            dict(width=1, scale=2, part=(2, 0, 0, 0)),
+            dict(width=1, scale=2, part=(0, 2, 0, 0)),
+            dict(width=1, scale=2, part=(1, 0, 2, 0)),
+            dict(width=1, scale=2, part=(0, 1, 0, 2)),
+            dict(width=8, part=(1, 0, 0, 0)),
+            dict(width=1, scale=8, part=(1, 0, 0, 0)),
+        ):
+            s = self.create_screen(cols=20, lines=8)
+            multicell(s, 'A', **kw)
+            ae((s.cursor.x, s.cursor.y, cells(s, 0, range(1))), (0, 0, [None]), kw)
+
+        # parts drawn next to each other form a single char
+        s = self.create_screen(cols=6, lines=4)
+        draw_at(s, 2, 1, 'A', width=1, scale=2, part=(0, 1, 0, 1))
+        draw_at(s, 1, 1, 'A', width=1, scale=2, part=(0, 0, 1, 1))
+        draw_at(s, 1, 2, 'A', width=1, scale=2, part=(1, 0, 1, 1))
+        for y in (1, 2):
+            ae(cells(s, y, range(1, 3)), [(0, y - 1, 2, 1), (1, y - 1, 2, 1)])
+        # which is erased as a whole
+        s.cursor_position(3, 3)
+        parse_bytes(s, b'\x1b[X')
+        for y in (1, 2):
+            ae(cells(s, y, range(1, 3)), [None, None])
+        # parts of different chars do not
+        s = self.create_screen(cols=6, lines=4)
+        draw_at(s, 1, 0, 'A', width=1, scale=2, part=(0, 0, 0, 1))
+        draw_at(s, 2, 0, 'B', width=1, scale=2, part=(0, 1, 0, 1))
+        s.cursor_position(3, 1)
+        parse_bytes(s, b'\x1b[X')
+        ae((cells(s, 1, range(2)), cells(s, 2, range(2))), ([(0, 0, 2, 1), (1, 0, 2, 1)], [None, None]))
+        # nor do parts that do not line up
+        s = self.create_screen(cols=6, lines=4)
+        draw_at(s, 1, 0, 'A', width=1, scale=2, part=(0, 0, 0, 1))
+        draw_at(s, 2, 1, 'A', width=1, scale=2, part=(0, 1, 0, 1))
+        s.cursor_position(3, 2)
+        parse_bytes(s, b'\x1b[X')
+        ae((cells(s, 1, range(2)), cells(s, 2, range(1, 3))), ([(0, 0, 2, 1), (1, 0, 2, 1)], [None, None]))
+
+        # drawing the cells of a char again over the same cells keeps its other cells
+        s = self.create_screen(cols=6, lines=4)
+        draw_at(s, 1, 1, 'A', scale=2)
+        draw_at(s, 2, 1, 'A', width=1, scale=2, part=(0, 1, 0, 1))
+        draw_at(s, 1, 2, 'A', width=1, scale=2, part=(1, 0, 1, 2))
+        for y in (1, 2):
+            ae(cells(s, y, range(1, 3)), [(0, y - 1, 2, 1), (1, y - 1, 2, 1)])
+        # with the new style
+        s.cursor.bold = True
+        draw_at(s, 2, 1, 'A', width=1, scale=2, part=(0, 1, 0, 1))
+        ae((s.line(1).cursor_from(1).bold, s.line(2).cursor_from(1).bold), (False, True))
+        # parts are drawn exactly at the cursor, drawing the cells of another
+        # char over its lower rows removes it entirely, rather than skipping
+        # them, as for complete chars
+        draw_at(s, 2, 1, 'B', width=1, scale=2, part=(0, 1, 0, 1))
+        ae((s.cursor.x, cells(s, 2, range(1, 5))), (3, [(0, 1, 2, 1), (1, 1, 2, 1), None, None]))
+        ae(cells(s, 1, range(1, 5)), [None, None, None, None])
+        ae(s.line(2).cursor_from(1).bold, True)
+        self.assertNotIn('A', str(s.line(1)))
+        # as does drawing the same char at other positions in its block
+        draw_at(s, 1, 1, 'B', width=1, scale=2, part=(0, 0, 0, 1))
+        ae(cells(s, 1, range(1, 3)), [(0, 0, 2, 1), (1, 0, 2, 1)])
+        draw_at(s, 2, 1, 'B', width=1, scale=2, part=(1, 1, 1, 1))
+        ae((s.cursor.x, cells(s, 1, range(1, 3)), cells(s, 2, range(1, 3))), (2, [None, None], [(1, 1, 2, 1), None]))
+        # complete chars are still moved past the lower rows of multiline chars
+        s = self.create_screen(cols=6, lines=4)
+        draw_at(s, 1, 1, 'A', scale=2)
+        draw_at(s, 2, 1, 'C', scale=1)
+        ae((cells(s, 2, range(1, 4)), s.cpu_cells(2, 3)['text']), ([(0, 1, 2, 1), (1, 1, 2, 1), (0, 0, 1, 1)], 'C'))
+
+    def test_multicell_parts_as_ansi(self):
+        # Chars of which only some cells are present are written as the parts
+        # present, so that writing the ANSI text back gives the same cells
+        from kitty.window import as_text
+
+        ae = self.ae
+
+        def cells(s, with_history=True):
+            # the cells of all rows, the scrollback included, without the leading and trailing empty rows
+            rows = []
+            for y in range(-s.historybuf.count if with_history else 0, s.lines):
+                row = []
+                for x in range(s.columns):
+                    c = s.cpu_cells(y, x)
+                    m = c['mcd']
+                    # blank cells are written as spaces
+                    row.append(c['text'].strip() if m is None else (c['x'], c['y'], m['scale'], m['width'], m['subscale_n'], m['subscale_d']))
+                rows.append(row)
+            empty = [''] * s.columns
+            while rows and rows[0] == empty:
+                del rows[0]
+            while rows and rows[-1] == empty:
+                del rows[-1]
+            return rows
+
+        def replay(s, ansi):
+            r = self.create_screen(cols=s.columns, lines=s.lines, scrollback=50)
+            parse_bytes(r, ansi.replace('\n', '\r\n').encode())
+            return r
+
+        def round_trip(s, **kw):
+            ansi = as_text(s, as_ansi=True, **kw)
+            ae(cells(replay(s, ansi)), cells(s), repr(ansi))
+            return ansi
+
+        def draw_at(s, y, x, *a, **kw):
+            s.cursor_position(y + 1, x + 1)
+            multicell(s, *a, **kw)
+
+        def setup(scrollback=0):
+            s = self.create_screen(cols=8, lines=6, scrollback=scrollback)
+            # the bottom row of a double sized char at the top of the screen
+            draw_at(s, 0, 0, 'A', width=1, scale=2, part=(0, 1, 0, 1))
+            s.draw('ab')
+            # the top row of a double sized char, above other text
+            draw_at(s, 2, 0, 'B', width=1, scale=2, part=(0, 0, 0, 1))
+            s.cursor_position(4, 1)
+            s.draw('cdefgh')
+            # a complete double sized char
+            draw_at(s, 2, 4, 'C', scale=2)
+            # two columns of the two lower rows of a triple sized char
+            draw_at(s, 3, 1, 'D', width=1, scale=3, part=(1, 1, 2, 2))
+            # the halves of wide chars, at the edges of a line
+            draw_at(s, 5, 0, '好', width=2, part=(1, 0, 1, 0))
+            draw_at(s, 5, 7, '猫', width=2, part=(0, 0, 1, 0))
+            # the top row of a double sized char at the bottom of the screen
+            draw_at(s, 5, 3, 'E', width=1, scale=2, part=(0, 0, 0, 1))
+            return s
+
+        s = setup()
+        ansi = round_trip(s)
+        self.assertIn('\x1b]66;w=1:s=2:y=1;A\a', ansi)
+        self.assertIn('\x1b]66;w=1:s=2:r=1;B\a', ansi)
+        self.assertIn('\x1b]66;s=2;C\a', ansi)  # complete chars are written as before
+        self.assertIn('\x1b]66;w=1:s=3:x=1:y=1;D\a', ansi)
+        self.assertIn('\x1b]66;w=2:x=1;好\a', ansi)
+        self.assertIn('\x1b]66;w=2:c=1;猫\a', ansi)
+        # the line buffer
+        lines = []
+        s.linebuf.as_ansi(lines.append)
+        ae(cells(replay(s, ''.join(lines))), cells(s))
+        # copying the selection as ANSI
+        s.start_selection(0, 0)
+        s.update_selection(s.columns - 1, s.lines - 1)
+        ansi = ''.join(s.text_for_selection(True, False))
+        ae(cells(replay(s, ansi)), cells(s), repr(ansi))
+        # starting at a lower row of a complete char, whose top row is
+        # selected with it, and of a part, which is written from the first line
+        s.start_selection(0, 3)
+        s.update_selection(s.columns - 1, 4)
+        ae(s.text_for_selection(True, False), ('\x1b]66;s=2;C\x07', '\nc\x1b]66;w=1:s=3:x=1:y=1;D\x07f', '\x1b[m'))
+        # selecting the bottom row of a part selects its top row, as for complete chars
+        s.start_selection(0, 4)
+        s.update_selection(s.columns - 1, 4)
+        ae(s.text_for_selection(True, False), ('\x1b]66;w=1:s=3:x=1:y=1;D\x07', '\x1b[m'))
+        ae(s.text_for_selection(False, False), ('D',))
+
+        # a part after the cells of the same char continuing from the rows
+        # above, which are not written, is written after a space, which a
+        # terminal moves past them, and moving back over it, so that it does
+        # not replace them
+        s = self.create_screen(cols=6, lines=3)
+        draw_at(s, 0, 0, 'A', width=1, scale=3, part=(1, 0, 2, 0))
+        draw_at(s, 2, 2, 'A', width=1, scale=3, part=(1, 2, 2, 1))
+        ansi = round_trip(s)
+        self.assertIn(' \x1b[D\x1b]66;w=1:s=3:x=1:y=2;A\a', ansi)
+        # also when the cells not written start at the first column, after cells not written elsewhere in a line above
+        s = self.create_screen(cols=8, lines=4)
+        draw_at(s, 0, 3, 'X', scale=2)
+        draw_at(s, 1, 5, 'P', width=1, scale=2, part=(0, 1, 0, 1))
+        draw_at(s, 1, 0, 'Y', scale=2)
+        draw_at(s, 2, 2, 'Q', width=1, scale=2, part=(0, 1, 0, 1))
+        ansi = round_trip(s)
+        self.assertIn(' \x1b[D\x1b]66;w=1:s=2:y=1;P\a', ansi)
+        self.assertIn(' \x1b[D\x1b]66;w=1:s=2:y=1;Q\a', ansi)
+
+        # chars split between the scrollback and the screen
+        s = setup(scrollback=20)
+        s.cursor_position(6, 1)
+        parse_bytes(s, b'\n\n\n\n')
+        ae(s.historybuf.count, 4)
+        round_trip(s, add_history=True)
+        # the screen alone, its rows continuing chars in the scrollback are written as parts
+        ae(s.cpu_cells(0, 1)['y'], 2)
+        ansi = as_text(s, as_ansi=True)
+        self.assertIn('\x1b]66;w=1:s=3:x=1:y=2;D\a', ansi)
+        ae(cells(replay(s, ansi)), cells(s, with_history=False), repr(ansi))
+        # the scrollback alone, with the pager history
+        s = setup(scrollback=2)
+        parse_bytes(s, b'\x1b[6;1H' + b'\n' * 12)
+        self.assertIn('\x1b]66;w=1:s=2:y=1;A\a', s.historybuf.pagerhist_as_text())
+        ae(cells(s), [])  # all lines of the setup are in the pager history
+        ansi = as_text(s, as_ansi=True, add_history=True)
+        ae(cells(replay(s, ansi)), cells(setup()), repr(ansi))
+
+        # a complete char whose rows are in the scrollback and on the screen
+        s = self.create_screen(cols=4, lines=2, scrollback=5)
+        s.draw('x')
+        draw_at(s, 0, 1, 'F', scale=2)
+        parse_bytes(s, b'\x1b[2;1H\n')
+        ansi = round_trip(s, add_history=True)
+        self.assertIn('\x1b]66;s=2;F\a', ansi)
+        self.assertNotIn('y=1', ansi)
+        # and whose top row is in the pager history and bottom row in the scrollback
+        for i in range(20):
+            if 'F' in s.historybuf.pagerhist_as_text():
+                break
+            parse_bytes(s, b'\n')
+        ae(s.cpu_cells(-s.historybuf.count, 1)['y'], 1)
+        ansi = as_text(s, as_ansi=True, add_history=True)
+        ae(ansi.count('F'), 1)
+        self.assertIn('\x1b]66;s=2;F\a', ansi)
+        self.assertNotIn('y=1', ansi)
+
+    def test_multicell_parts_selection_and_cursor(self):
+        # Selections and the cursor cover only the cells of a multiline char
+        # that are present, as it can be partial
+        ae = self.ae
+
+        def draw_at(s, y, x, *a, **kw):
+            s.cursor_position(y + 1, x + 1)
+            multicell(s, *a, **kw)
+
+        s = self.create_screen(cols=6, lines=4)
+        draw_at(s, 0, 0, 'A', scale=2)  # a complete char in rows 0 and 1
+        draw_at(s, 2, 0, 'B', width=1, scale=2, part=(0, 1, 0, 1))  # the bottom row of a char
+        draw_at(s, 3, 0, 'C', width=1, scale=2, part=(0, 0, 0, 1))  # the top row of a char
+        draw_at(s, 3, 4, '好', width=2, part=(1, 0, 1, 0))  # the right half of a wide char
+
+        def selected_rows(x0, y0, x1, y1):
+            s.start_selection(x0, y0)
+            s.update_selection(x1, y1)
+            sel = s.current_selections()
+            leading = len(sel) // s.columns - s.lines  # the selection data can have extra leading rows
+            return [y for y in range(s.lines) if sel[(y + leading) * s.columns] & 1]
+
+        ae(selected_rows(0, 0, 1, 0), [0, 1])
+        ae(selected_rows(0, 1, 1, 1), [0, 1])
+        ae(selected_rows(0, 2, 1, 2), [2])
+        ae(selected_rows(0, 3, 1, 3), [3])
+        s.clear_selection()
+
+        ae(s.test_large_cursor_extent(0, 0), (2, 2))
+        for x, y in ((1, 0), (0, 1), (1, 2), (5, 3)):
+            self.assertIsNone(s.test_large_cursor_extent(x, y), (x, y))
+        ae(s.test_large_cursor_extent(0, 2), (1, 2))
+        ae(s.test_large_cursor_extent(0, 3), (1, 2))
+        ae(s.test_large_cursor_extent(4, 3), (1, 1))
+
+    def test_multicell_parts_and_line_operations(self):
+        # Scrolling and inserting or deleting lines remove only the multiline
+        # chars they tear, chars of which only some rows are present are kept
+        ae = self.ae
+
+        def cell_y(s, y, x=0):
+            c = s.cpu_cells(y, x)
+            return c['y'] if c['mcd'] else None
+
+        def screen(*parts):
+            s = self.create_screen(cols=5, lines=6)
+            for y, part in parts:
+                s.cursor_position(y + 1, 1)
+                multicell(s, 'A', width=1, scale=2, part=part)
+            return s
+
+        top, bottom = (0, 0, 0, 1), (0, 1, 0, 1)
+        # the top row of a char at the bottom of the scroll region and the
+        # bottom row of a char at its top
+        for seq, expected in (
+            (b'\x1b[2;5r\x1b[S', [None, None, None, 0, None, None]),
+            (b'\x1b[2;5r\x1b[T', [None, None, 1, None, None, None]),
+            (b'\x1b[2;5r\x1b[5;1H\n', [None, None, None, 0, None, None]),
+            (b'\x1b[2;5r\x1b[2;1H\x1bM', [None, None, 1, None, None, None]),
+        ):
+            s = screen((4, top), (1, bottom))
+            parse_bytes(s, seq)
+            ae([cell_y(s, y) for y in range(s.lines)], expected, seq)
+        # inserting lines at the bottom row of a char and deleting lines above the top row of a char
+        s = screen((2, bottom))
+        parse_bytes(s, b'\x1b[3;1H\x1b[L')
+        ae([cell_y(s, y) for y in range(s.lines)], [None, None, None, 1, None, None])
+        s = screen((3, top))
+        parse_bytes(s, b'\x1b[2;1H\x1b[2M')
+        ae([cell_y(s, y) for y in range(s.lines)], [None, 0, None, None, None, None])
+        # a complete char below the deleted lines is moved intact
+        s = self.create_screen(cols=5, lines=6)
+        s.cursor_position(4, 1)
+        multicell(s, 'A', scale=2)
+        parse_bytes(s, b'\x1b[2;1H\x1b[2M')
+        ae([cell_y(s, y) for y in range(s.lines)], [None, 0, 1, None, None, None])
+        # rewrapping keeps parts, the rows below the first row of a part move with it
+        s = self.create_screen(cols=8, lines=6, scrollback=10)
+        s.draw('abcdef')
+        s.cursor_position(2, 7)
+        multicell(s, 'A', width=1, scale=2, part=bottom)
+        s.cursor_position(3, 1)
+        multicell(s, 'B', width=1, scale=3, part=(1, 1, 2, 2))
+        s.draw('x')
+        multicell(s, '好', width=2, part=(1, 0, 1, 0))
+        multicell(s, '猫', width=2, part=(0, 0, 1, 0))
+
+        def parts(s):
+            ans = []
+            for y in range(-s.historybuf.count, s.lines):
+                for x in range(s.columns):
+                    c = s.cpu_cells(y, x)
+                    if c['mcd']:
+                        ans.append((c['x'], c['y'], c['mcd']['scale'], c['mcd']['width']))
+            return ans
+
+        before = sorted(parts(s))
+        for lines, cols in ((6, 4), (8, 10)):
+            s.resize(lines, cols)
+            ae(sorted(parts(s)), before, (lines, cols))
+            # the second row of the part of B is below its first row
+            for y in range(-s.historybuf.count + 1, s.lines):
+                for x in range(s.columns):
+                    c = s.cpu_cells(y, x)
+                    if c['mcd'] and c['mcd']['scale'] == 3 and c['y'] == 2:
+                        a = s.cpu_cells(y - 1, x)
+                        ae((a['x'], a['y']), (c['x'], 1), (lines, cols))
+
+        # while chars split by the operations are removed
+        for seq in (b'\x1b[4;1H\x1b[L', b'\x1b[3;1H\x1b[2M', b'\x1b[1;3r\x1b[S', b'\x1b[4;6r\x1b[T'):
+            s = self.create_screen(cols=5, lines=6)
+            s.cursor_position(3, 1)
+            multicell(s, 'A', scale=2)
+            parse_bytes(s, seq)
+            ae([cell_y(s, y) for y in range(s.lines)], [None] * s.lines, seq)
+
+    def test_multicell_chars_in_scrollback(self):
+        # Multiline chars split between the scrollback and the screen, and
+        # those whose top rows were moved out of the top of the scrollback,
+        # into the pager history or discarded
+        from kitty.window import as_text
+
+        ae = self.ae
+
+        def screen(scrollback, num_lines, **opts):
+            s = self.create_screen(cols=6, lines=5, scrollback=scrollback, options=opts or None)
+            s.draw('top')
+            s.cursor_position(2, 1)
+            multicell(s, 'A', scale=3)
+            s.draw('x')
+            parse_bytes(s, b'\x1b[5;1H' + b'\n' * num_lines)
+            return s
+
+        def selected_rows(s, y0, y1):
+            # the range lines highlighted when selecting the visual rows y0 to y1
+            s.start_selection(0, y0)
+            s.update_selection(3, y1)
+            sel = s.current_selections()
+            leading = len(sel) // s.columns - s.lines
+            ans = [y - s.scrolled_by for y in range(-leading, s.lines) if sel[(y + leading) * s.columns] & 1]
+            return ans
+
+        # split between the scrollback and the screen
+        s = screen(5, 2)
+        ae([s.cpu_cells(y, 0)['y'] for y in (-1, 0, 1)], [0, 1, 2])
+        ae(as_text(s, as_ansi=True, add_history=True).count('A'), 1)
+        self.assertIn('\x1b]66;s=3;A\x07x', as_text(s, as_ansi=True, add_history=True))
+        self.assertIn('\x1b]66;w=1:s=3:y=1;A\x07', as_text(s, as_ansi=True))
+        s.start_selection(0, -1)
+        s.update_selection(3, 1)
+        ae(s.text_for_selection(False, False), ('Ax',))
+        ae(s.text_for_selection(True, False), ('\x1b]66;s=3;A\x07x', '\x1b[m'))
+        s.scroll(2, True)
+        ae(selected_rows(s, 1, 1), [-1, 0, 1])
+
+        # with the top row in the pager history or discarded
+        for ph in (1024, 0):
+            s = screen(2, 7, scrollback_pager_history_size=ph)
+            top = -s.historybuf.count
+            ae([s.cpu_cells(y, 0)['y'] for y in (top, top + 1)], [1, 2], ph)
+            ansi = as_text(s, as_ansi=True, add_history=True)
+            ae(ansi.count('A'), 1, ph)
+            if ph:
+                # written complete into the pager history, which the scrollback continues
+                self.assertIn('\x1b]66;s=3;A\x07x', s.historybuf.pagerhist_as_text())
+            else:
+                self.assertIn('\x1b]66;w=1:s=3:y=1;A\x07', ansi)
+            # selections are only of the scrollback and the screen
+            s.start_selection(0, top)
+            s.update_selection(3, top)
+            ae(s.text_for_selection(False, False), ('A',), ph)
+            ae(s.text_for_selection(True, False), ('\x1b]66;w=1:s=3:y=1;A\x07', '\x1b[m'), ph)
+            s.scroll(s.historybuf.count, True)
+            ae(selected_rows(s, 0, 0), [top, top + 1], ph)
+
+    def test_multicell_parts_edge_cases(self):
+        from kitty.window import as_text
+
+        ae = self.ae
+
+        def cells(s, first=0):
+            ans = []
+            for y in range(first, s.lines):
+                row = []
+                for x in range(s.columns):
+                    c = s.cpu_cells(y, x)
+                    row.append(c['text'].strip() if c['mcd'] is None else (c['x'], c['y'], c['mcd']['scale'], c['mcd']['width']))
+                ans.append(row)
+            return ans
+
+        def round_trip(s):
+            ansi = as_text(s, as_ansi=True)
+            r = self.create_screen(cols=s.columns, lines=s.lines)
+            parse_bytes(r, ansi.replace('\n', '\r\n').encode())
+            ae(cells(r), cells(s), repr(ansi))
+            return ansi
+
+        # selecting only the bottom row of a char at least three rows tall selects its top row, with its text
+        s = self.create_screen(cols=6, lines=5)
+        parse_bytes(s, b'\x1b]66;s=3;A\x07x')
+        s.start_selection(0, 2)
+        s.update_selection(5, 2)
+        ae(s.text_for_selection(False, False), ('A',))
+
+        # parts after cells not written, at the start of a line continuing the
+        # line above, or after the cells not written at the end of the line above
+        for setup in (
+            b'\x1b]66;s=2;A\x07bcdeZ\x1b[2;3H\x1b]66;w=2:c=1;\xe7\x8c\xab\x07',
+            b'\x1b[1;5H\x1b]66;s=2;A\x07\x1b[2;1Hab\x1b[2;7H\x1b]66;w=1:s=2:y=1;B\x07',
+            b'\x1b]66;s=5:w=1;A\x07Z\x1b[2;6H\x1b]66;w=2:c=1;\xe7\x8c\xab\x07',
+        ):
+            s = self.create_screen(cols=6, lines=6)
+            parse_bytes(s, setup)
+            round_trip(s)
+
+        # the scrollback of the main screen written while the alternate screen is active
+        s = self.create_screen(cols=6, lines=4, scrollback=10)
+        parse_bytes(s, b'top\r\n\x1b]66;s=3;A\x07\x1b[4;1H\n\n')
+        ae([s.cpu_cells(y, 0)['y'] for y in (-1, 0, 1)], [0, 1, 2])
+        main = as_text(s, as_ansi=True, add_history=True)
+        s.toggle_alt_screen()
+        ae(as_text(s, as_ansi=True, add_history=True, alternate_screen=True), main)
+
+        # plain text includes the text of parts
+        s = self.create_screen(cols=6, lines=3)
+        parse_bytes(s, b'\x1b]66;w=1:s=2:y=1;A\x07x')
+        ae(as_text(s).splitlines()[0], 'Ax')
+        s.start_selection(0, 0)
+        s.update_selection(5, 0)
+        ae(s.text_for_selection(False, False), ('Ax',))
+
+        # chars that differ only in their alignment are different chars
+        s = self.create_screen(cols=6, lines=3)
+        parse_bytes(s, b'\x1b[2;1H\x1b]66;w=1:s=2:y=1:r=1;A\x07\x1b[1;1H\x1b]66;w=1:s=2:v=1:r=2;A\x07')
+        ae([(s.cpu_cells(y, 0)['y'], s.cpu_cells(y, 0)['mcd']['vertical_align']) for y in (0, 1)], [(0, 1), (1, 1)])
+        s = self.create_screen(cols=6, lines=3)
+        parse_bytes(s, b'\x1b]66;s=2;A\x07\x1b[1;1H\x1b]66;w=1:s=2:v=1:r=1;A\x07')
+        ae([s.cpu_cells(y, 0)['mcd'] is None for y in (0, 1)], [False, True])
+
+        # the last line of the pager history is not used as the line above the
+        # scrollback after its lines are rewrapped, as lines can be dropped
+        s = self.create_screen(cols=6, lines=5, scrollback=2)
+        parse_bytes(s, b'top\r\n\x1b]66;s=3;A\x07\x1b[5;1H' + b'\n' * 7)
+        top = -s.historybuf.count
+        ae([s.cpu_cells(y, 0)['y'] for y in (top, top + 1)], [1, 2])
+        self.assertNotIn('y=1;A', as_text(s, as_ansi=True, add_history=True))
+        s.resize(4, 6)
+        self.assertIn('\x1b]66;s=3;A\x07', s.historybuf.pagerhist_as_text())
+        # the lower rows of the char in the scrollback are written as a part
+        self.assertRegex(as_text(s, as_ansi=True, add_history=True), '\x1b]66;w=1:s=3:y=[12](:r=1)?;A\x07')
+
+    def test_soft_wrapped_lines_as_ansi(self):
+        # Writing the ANSI text of soft wrapped lines back wraps them at the same places
+        from kitty.window import as_text
+
+        ae = self.ae
+
+        def cells(s, with_history):
+            rows = []
+            for y in range(-s.historybuf.count if with_history else 0, s.lines):
+                row = []
+                for x in range(s.columns):
+                    c = s.cpu_cells(y, x)
+                    row.append(c['text'].strip() if c['mcd'] is None else (c['x'], c['y'], c['mcd']['scale'], c['mcd']['width']))
+                rows.append(row)
+            empty = [''] * s.columns
+            while rows and rows[0] == empty:
+                del rows[0]
+            while rows and rows[-1] == empty:
+                del rows[-1]
+            return rows
+
+        def round_trip(setup, cols=6, lines=5, scrollback=0, add_history=False):
+            s = self.create_screen(cols=cols, lines=lines, scrollback=scrollback)
+            parse_bytes(s, setup)
+            ansi = as_text(s, as_ansi=True, add_history=add_history)
+            r = self.create_screen(cols=cols, lines=lines, scrollback=50)
+            parse_bytes(r, ansi.replace('\n', '\r\n').encode())
+            ae(cells(r, True), cells(s, add_history), repr(ansi))
+            return ansi
+
+        # the blank cells before a char that did not fit at the end of a line are not written
+        ae(round_trip(b'aaaa\xf0\x9f\x98\x9bbb', cols=5).rstrip(), '\x1b[maaaa\x1b[m\U0001f61bbb')
+        # soft wrapped lines ending with blank cells or cells continuing chars
+        # from the lines above, followed by lines that write no text or start
+        # with parts, also across the scrollback and the screen
+        for cols, lines, with_history, data in (
+            (
+                7,
+                7,
+                False,
+                (
+                    b'\x1b[4;6H\xe5\xa5\xbd'
+                    b'\x1b[4;5H\x1b]66;w=1:s=2:n=0:d=0:v=0:h=0:x=1:y=0:c=0:r=2;\xe5\xa5\xbd\x07'
+                    b'\x1b[6;7H\x1b]66;w=3:s=1:n=0:d=0:v=0:h=0:x=0:y=0:c=3:r=0;A\x07'
+                    b'\x1b[5;6H\x1b]66;w=3:s=1:n=0:d=0:v=0:h=0:x=1:y=0:c=1:r=1;B\x07'
+                    b'\x1b[1;2H\x1b]66;w=2:s=2:n=0:d=0:v=0:h=0:x=3:y=0:c=1:r=0;B\x07'
+                    b'\x1b[5;3H\x1b]66;w=3:s=2:n=0:d=0:v=0:h=0:x=5:y=1:c=1:r=1;\xe5\xa5\xbd\x07'
+                ),
+            ),
+            (
+                10,
+                7,
+                False,
+                (
+                    b'\x1b[1;3H\x1b]66;w=3:s=3:n=0:d=0:v=0:h=0:x=8:y=0:c=0:r=1;A\x07'
+                    b'\x1b[1;3H\x1b]66;w=1:s=3:n=0:d=0:v=0:h=0:x=0:y=2:c=1:r=1;B\x07'
+                    b'\x1b[3;10H\xe5\xa5\xbd'
+                    b'\x1b[7;1H\x1b]66;w=3:s=3:n=0:d=0:v=0:h=0:x=6:y=2:c=0:r=1;\xe5\xa5\xbd\x07'
+                    b'\x1b[2;4H\x1b]66;w=3:s=1:n=0:d=0:v=0:h=0:x=0:y=0:c=0:r=0;A\x07'
+                    b'\x1b[7;9H\x1b]66;w=3:s=3:n=0:d=0:v=0:h=0:x=8:y=1:c=0:r=0;A\x07'
+                    b'\x1b[1;7H\x1b]66;w=1:s=3:n=0:d=0:v=0:h=0:x=0:y=1:c=1:r=0;B\x07'
+                    b'\x1b[1;8H\x1b]66;w=3:s=3:n=0:d=0:v=0:h=0:x=4:y=1:c=4:r=2;\xe5\xa5\xbd\x07'
+                    b'\x1b[5;7H\x1b]66;w=2:s=1:n=0:d=0:v=0:h=0:x=1:y=0:c=1:r=1;\xe5\xa5\xbd\x07'
+                ),
+            ),
+            (
+                11,
+                7,
+                False,
+                (
+                    b'\x1b[5;4H\x1b]66;w=1:s=2:n=0:d=0:v=0:h=0:x=1:y=0:c=1:r=2;\xe5\xa5\xbd\x07'
+                    b'\x1b[1;8H\x1b]66;w=1:s=2:n=0:d=0:v=0:h=0:x=1:y=0:c=1:r=0;\xe5\xa5\xbd\x07'
+                    b'\x1b[2;3H\x1b]66;w=3:s=1:n=0:d=0:v=0:h=0:x=1:y=0:c=1:r=0;B\x07'
+                    b'\x1b[5;8H\xe5\xa5\xbd'
+                    b'\x1b[2;7H\x1b]66;w=2:s=3:n=0:d=0:v=0:h=0:x=3:y=2:c=1:r=1;A\x07'
+                    b'\x1b[2;7H\x1b]66;w=1:s=2:n=0:d=0:v=0:h=0:x=1:y=0:c=1:r=0;A\x07'
+                    b'\x1b[6;11H\x1b]66;w=2:s=2:n=0:d=0:v=0:h=0:x=3:y=0:c=0:r=0;\xe5\xa5\xbd\x07'
+                    b'\x1b[2;10H\x1b]66;w=2:s=2:n=0:d=0:v=0:h=0:x=0:y=1:c=4:r=0;\xe5\xa5\xbd\x07'
+                ),
+            ),
+            (
+                5,
+                7,
+                False,
+                (
+                    b'\x1b[3;4H\x1b]66;w=1:s=2:n=0:d=0:v=0:h=0:x=1:y=1:c=0:r=1;\xe5\xa5\xbd\x07'
+                    b'\x1b[4;1Hx'
+                    b'\x1b[2;5H\x1b]66;w=2:s=2:n=0:d=0:v=0:h=0:x=2:y=1:c=2:r=0;\xe5\xa5\xbd\x07'
+                    b'\x1b[1;3H\x1b]66;w=1:s=1:n=0:d=0:v=0:h=0:x=0:y=0:c=1:r=0;A\x07'
+                    b'\x1b[4;4H\xe5\xa5\xbd'
+                    b'\x1b[4;5Hab'
+                    b'\x1b[6;1H\xe5\xa5\xbd'
+                    b'\x1b[3;4H\x1b]66;w=1:s=3:n=0:d=0:v=0:h=0:x=1:y=2:c=2:r=0;\xe5\xa5\xbd\x07'
+                    b'\x1b[2;4H\x1b]66;w=1:s=1:n=0:d=0:v=0:h=0:x=0:y=0:c=0:r=0;A\x07'
+                ),
+            ),
+            (
+                7,
+                7,
+                True,
+                (
+                    b'\x1b[6;1Hab'
+                    b'\x1b[5;2H\x1b]66;w=1:s=1:n=0:d=0:v=0:h=0:x=0:y=0:c=1:r=0;A\x07'
+                    b'\x1b[3;1H\x1b]66;w=1:s=1:n=0:d=0:v=0:h=0:x=0:y=0:c=0:r=0;B\x07'
+                    b'\x1b[3;3H\x1b]66;w=1:s=1:n=0:d=0:v=0:h=0:x=0:y=0:c=0:r=1;\xe5\xa5\xbd\x07'
+                    b'\x1b[6;4H\x1b]66;w=1:s=1:n=0:d=0:v=0:h=0:x=0:y=0:c=1:r=0;A\x07'
+                    b'\x1b[3;5H\x1b]66;w=3:s=2:n=0:d=0:v=0:h=0:x=2:y=0:c=0:r=1;\xe5\xa5\xbd\x07'
+                    b'\x1b[2;7H\x1b]66;w=2:s=3:n=0:d=0:v=0:h=0:x=2:y=0:c=2:r=0;B\x07'
+                    b'\x1b[6;4H\x1b]66;w=3:s=2:n=0:d=0:v=0:h=0:x=4:y=0:c=1:r=2;\xe5\xa5\xbd\x07'
+                    b'\x1b[7;1H\n\n'
+                ),
+            ),
+            (
+                7,
+                3,
+                True,
+                (
+                    b'\x1b[2;4H\x1b]66;w=2:s=3:n=0:d=0:v=0:h=0:x=5:y=0:c=1:r=1;B\x07'
+                    b'\x1b[1;1Hab'
+                    b'\x1b[2;1H\x1b]66;w=3:s=2:n=0:d=0:v=0:h=0:x=1:y=1:c=4:r=1;B\x07'
+                    b'\x1b[3;6H\x1b]66;w=2:s=1:n=0:d=0:v=0:h=0:x=1:y=0:c=1:r=1;B\x07'
+                    b'\x1b[2;6H\x1b]66;w=3:s=2:n=0:d=0:v=0:h=0:x=3:y=0:c=0:r=0;A\x07'
+                    b'\x1b[1;7H\x1b]66;w=1:s=2:n=0:d=0:v=0:h=0:x=0:y=0:c=1:r=2;A\x07'
+                    b'\x1b[3;1H\x1b]66;w=3:s=2:n=0:d=0:v=0:h=0:x=5:y=1:c=0:r=1;\xe5\xa5\xbd\x07'
+                    b'\x1b[2;6H\x1b]66;w=3:s=2:n=0:d=0:v=0:h=0:x=1:y=1:c=4:r=0;B\x07'
+                    b'\x1b[3;1H\x1b]66;w=1:s=2:n=0:d=0:v=0:h=0:x=1:y=0:c=1:r=2;B\x07'
+                    b'\x1b[3;1H\n'
+                ),
+            ),
+        ):
+            round_trip(data, cols=cols, lines=lines, scrollback=lines if with_history else 0, add_history=with_history)
+
     def test_partial_multiline_chars(self):
         # Multiline chars can be partially scrolled off the edges of the screen
         # or the history buffer, such chars are kept and rendered partially.
-        # Chars must never be torn, i.e. have rows adjacent to their remaining
-        # part that are not part of the char, and code walking the rows of
-        # partial chars must stay within bounds.
-        def assert_not_torn(s, alt=False):
-            # checks the screen and when on the main screen the history buffer as well
+        # Chars must never be torn by an operation, i.e. split into parts that
+        # both remain, and code walking the rows of partial chars must stay
+        # within bounds.
+        def char_runs(s, alt):
+            # the runs of rows continuing each multiline char, as (x, first row, y of the first row, number of rows, scale)
             first = 0 if alt else -s.historybuf.count
             for y in range(first, s.lines):
                 for x in range(s.columns):
                     c = s.cpu_cells(y, x)
                     mcd = c['mcd']
-                    if mcd and mcd['scale'] > 1:
-                        top = y - c['y']
-                        for r in range(max(first, top), min(s.lines, top + mcd['scale'])):
-                            o = s.cpu_cells(r, x)
-                            self.assertIsNotNone(o['mcd'], f'Torn char at ({x}, {y}) row: {r}')
-                            self.ae((o['y'], o['mcd']['scale']), (r - top, mcd['scale']), f'Torn char at ({x}, {y}) row: {r}')
+                    if not mcd or mcd['scale'] < 2:
+                        continue
+                    above = s.cpu_cells(y - 1, x) if y > first else None
+                    if above and above['mcd'] and above['mcd']['scale'] == mcd['scale'] and above['y'] == c['y'] - 1 and above['x'] == c['x']:
+                        continue  # not the first row of the run
+                    n = 1
+                    while y + n < s.lines:
+                        o = s.cpu_cells(y + n, x)
+                        if not o['mcd'] or o['mcd']['scale'] != mcd['scale'] or o['y'] != c['y'] + n or o['x'] != c['x']:
+                            break
+                        n += 1
+                    self.assertLessEqual(c['y'] + n, mcd['scale'])
+                    yield x, y, c['y'], n, mcd['scale']
+
+        def assert_not_torn(s, alt=False):
+            # The rows of a char present are complete or cut off at the edges of the screen (or of the history buffer)
+            first = 0 if alt else -s.historybuf.count
+            for x, y, cy, n, scale in char_runs(s, alt):
+                msg = f'Torn char at ({x}, {y}): {cy=} {n=} {scale=}'
+                if cy > 0:
+                    self.ae(y, first, msg)
+                if cy + n < scale:
+                    self.ae(y + n, s.lines, msg)
+
+        def assert_in_bounds(s, alt=False):
+            # Partial chars can be anywhere, only check that walking their rows stays in bounds
+            for _ in char_runs(s, alt):
+                pass
 
         def cell_y(s, y, x=0):
             c = s.cpu_cells(y, x)
@@ -174,16 +840,17 @@ class TestMulticell(BaseTest):
         parse_bytes(s, b'\x1b[5;3H\xd9\x8b')
         assert_not_torn(s)
         self.ae(str(s.line(4)), 'A\u064b')
-        # once it is no longer at the edge it is torn, so it is removed
+        # and kept, partially, when it is no longer at the edge
         parse_bytes(s, b'\x1b[S')
-        assert_not_torn(s)
-        self.ae([cell_y(s, y) for y in range(s.lines)], [None] * s.lines)
-        # rewrapping it must stay in bounds, partial chars are dropped by rewrap
+        self.ae([cell_y(s, y) for y in range(s.lines)], [None, None, None, 0, None])
+        # rewrapping it must stay in bounds, partial chars are kept by rewrap
         for lines, columns in ((3, 8), (7, 5), (5, 3)):
             s = self.create_screen(cols=5, lines=5)
             parse_bytes(s, prefix + b'\x1b[2T')
             s.resize(lines, columns)
-            assert_not_torn(s)
+            assert_in_bounds(s)
+            ae = self.ae
+            ae([(r[2], r[3], r[4]) for r in char_runs(s, False)], [(0, 1, 2)] * 2, (lines, columns))
         # scrolling by one moves the char intact
         s = self.create_screen(cols=5, lines=5)
         parse_bytes(s, prefix + b'\x1b[T')
@@ -195,9 +862,10 @@ class TestMulticell(BaseTest):
         parse_bytes(s, b'\x1b]66;s=3;A\x07\x1b[S')
         assert_not_torn(s, True)
         self.ae([cell_y(s, y) for y in range(s.lines)], [1, 2, None, None, None])
+        # and kept, partially, when it is no longer at the edge
         parse_bytes(s, b'\x1b[T')
-        assert_not_torn(s, True)
-        self.ae([cell_y(s, y) for y in range(s.lines)], [None] * s.lines)
+        assert_in_bounds(s, True)
+        self.ae([cell_y(s, y) for y in range(s.lines)], [None, 1, 2, None, None])
         # rows evicted from the history buffer, which is at least as tall as the screen
         s = self.create_screen(cols=3, lines=3, scrollback=3)
         parse_bytes(s, b'\x1b]66;s=3;A\x07' + b'\r\n' * 6)
@@ -222,10 +890,11 @@ class TestMulticell(BaseTest):
                         parse_bytes(s, b'\x1b[%d;1H' % y)
                     parse_bytes(s, scroll)
                     assert_not_torn(s, alt)
+                    # rewrap keeps the chars cut off at the edges of the screen, which can then be elsewhere
                     s.resize(3, 8)
-                    assert_not_torn(s, alt)
+                    assert_in_bounds(s, alt)
                     s.resize(7, 4)
-                    assert_not_torn(s, alt)
+                    assert_in_bounds(s, alt)
         # operations on partial chars
         setups = (
             prefix + b'\x1b[2T',
@@ -263,22 +932,22 @@ class TestMulticell(BaseTest):
                         if alt:
                             s.toggle_alt_screen()
                         parse_bytes(s, setup + op + op2)
-                        assert_not_torn(s, alt)
+                        assert_in_bounds(s, alt)
                         s.resize(6, 4)
-                        assert_not_torn(s, alt)
+                        assert_in_bounds(s, alt)
         # a char cut off at the bottom of the alternate screen stays cut off when
-        # resizing without changing the number of lines, and is removed once
-        # it is no longer at the bottom
+        # resizing without changing the number of lines, and is kept, partially,
+        # once it is no longer at the bottom
         s = self.create_screen(cols=5, lines=5)
         s.toggle_alt_screen()
         parse_bytes(s, prefix + b'\x1b[2T')
         s.resize(5, 7)
         self.ae([cell_y(s, y) for y in range(s.lines)], [None, None, None, None, 0])
         parse_bytes(s, b'\x1b[S')
-        assert_not_torn(s, True)
-        self.ae([cell_y(s, y) for y in range(s.lines)], [None] * s.lines)
+        assert_in_bounds(s, True)
+        self.ae([cell_y(s, y) for y in range(s.lines)], [None, None, None, 0, None])
         # inserting lines at the bottom of the screen cuts chars off, they are
-        # kept, and removed once they are no longer at the bottom
+        # kept, also once they are no longer at the bottom
         for alt in (False, True):
             s = self.create_screen(cols=5, lines=5)
             if alt:
@@ -287,20 +956,21 @@ class TestMulticell(BaseTest):
             assert_not_torn(s, alt)
             self.ae([cell_y(s, y) for y in range(s.lines)], [None, None, None, None, 0])
             parse_bytes(s, b'\x1b[5;1H\n')
-            assert_not_torn(s, alt)
-            self.ae([cell_y(s, y) for y in range(s.lines)], [None] * s.lines)
-        # the cursor on a partial char that is dropped by rewrap is placed where the char was
+            assert_in_bounds(s, alt)
+            self.ae([cell_y(s, y) for y in range(s.lines)], [None, None, None, 0, None])
+        # the cursor on a partial char that is kept by rewrap stays on it
         s = self.create_screen(cols=5, lines=6, scrollback=20)
         parse_bytes(s, b'abcdefghij\x1b[4;1H\x1b]66;s=2;A\x07\x1b[2T\x1b[6;3HZ\x1b[6;2H')
         self.ae(str(s.line(5)), 'AZ')
         s.resize(6, 3)
-        self.ae(str(s.line(5)), 'Z')
-        self.ae((s.cursor.x, s.cursor.y), (0, 5))
-        # and a cursor after it is placed relative to where the char was
+        self.ae(str(s.line(5)), 'AZ')
+        self.ae((s.cursor.x, s.cursor.y), (1, 5))
+        # and a cursor after it is placed relative to it
         s = self.create_screen(cols=5, lines=6, scrollback=20)
         parse_bytes(s, b'abcdefghij\r\nk\r\n\x1b[4;1H\x1b]66;s=2;A\x07\x1b[2T\x1b[6;4H')
         s.resize(9, 3)
-        self.ae((s.cursor.x, s.cursor.y), (1, 7))
+        self.ae(str(s.line(7)), 'A')
+        self.ae((s.cursor.x, s.cursor.y), (2, 7))
         # hard reset clears the alternate screen as well
         s = self.create_screen(cols=5, lines=5)
         parse_bytes(s, b'\x1b[?47h' + prefix + b'\x1b[?47l\x1bc\x1b[?47h')
@@ -816,11 +1486,12 @@ def test_multicell(self: TestMulticell) -> None:
         assert_line('\0' * s.columns, y)
     assert_line('b_' + '\0' * (s.columns - 2), s.lines - 1)
     ac(0, s.lines - 1, y=0, scale=2)
-    # once it is no longer at the bottom it is torn, so it is removed
+    # and kept, partially, when it is no longer at the bottom
     s.cursor.y = s.lines - 1
     s.index()
     for y in range(s.lines):
-        assert_line('\0' * s.columns, y)
+        assert_line('b_' + '\0' * (s.columns - 2) if y == s.lines - 2 else '\0' * s.columns, y)
+    ac(0, s.lines - 2, y=0, scale=2)
     s.reset()
     multicell(s, 'a', scale=2)
     s.insert_lines(2)

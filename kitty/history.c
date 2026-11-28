@@ -96,8 +96,30 @@ alloc_pagerhist(size_t pagerhist_sz) {
 }
 
 static void
+pagerhist_forget_last_line(PagerHistoryBuf *ph) {
+    free(ph->last_line);
+    ph->last_line = NULL;
+    ph->last_line_xnum = 0;
+}
+
+static void
+pagerhist_remember_last_line(PagerHistoryBuf *ph, const CPUCell *cells, index_type xnum) {
+    if (ph->last_line_xnum != xnum) {
+        pagerhist_forget_last_line(ph);
+        if (!(ph->last_line = malloc(sizeof(CPUCell) * xnum))) {
+            // Without the line, the chars continuing from it in the history are written as parts
+            log_error("Out of memory remembering the last line of the scrollback pager history");
+            return;
+        }
+        ph->last_line_xnum = xnum;
+    }
+    memcpy(ph->last_line, cells, sizeof(CPUCell) * xnum);
+}
+
+static void
 free_pagerhist(HistoryBuf *self) {
     if (self->pagerhist && self->pagerhist->ringbuf) ringbuf_free((ringbuf_t *)&self->pagerhist->ringbuf);
+    if (self->pagerhist) pagerhist_forget_last_line(self->pagerhist);
     free(self->pagerhist);
     self->pagerhist = NULL;
 }
@@ -118,6 +140,7 @@ pagerhist_extend(PagerHistoryBuf *ph, size_t minsz) {
 
 static void
 pagerhist_clear(HistoryBuf *self) {
+    if (self->pagerhist) pagerhist_forget_last_line(self->pagerhist);
     if (self->pagerhist && self->pagerhist->ringbuf) {
         self->pagerhist->bidi_open = 0;
         ringbuf_reset(self->pagerhist->ringbuf);
@@ -333,13 +356,42 @@ pagerhist_write_ucs4(PagerHistoryBuf *ph, const Py_UCS4 *buf, size_t sz) {
     return true;
 }
 
+bool
+historybuf_row_cells(HistoryBuf *self, int64_t lnum, const CPUCell **cells) {
+    // The cells of the line with line number lnum, see container_row_func.
+    // The rows below the newest line, on the screen, are not known. The row
+    // above the oldest line is the last line written to the pager history.
+    if (lnum < 0) return false;
+    if (lnum < (int64_t)self->count) *cells = historybuf_cpu_cells(self, (index_type)lnum);
+    else {
+        const PagerHistoryBuf *ph = self->pagerhist;
+        *cells = lnum == (int64_t)self->count && ph && ph->last_line && ph->last_line_xnum == self->xnum ? ph->last_line : NULL;
+    }
+    return true;
+}
+
+// The rows around a line being written as ANSI, see ANSILineState, lnum is the line number of the line
+typedef struct HistoryNeighbourRows {
+    HistoryBuf *historybuf;
+    index_type lnum;
+} HistoryNeighbourRows;
+
+static bool
+history_neighbour_row(void *ctx, int dy, const CPUCell **cells) {
+    const HistoryNeighbourRows *r = ctx;
+    // line numbers count from the newest line, so the rows below have smaller ones
+    return historybuf_row_cells(r->historybuf, (int64_t)r->lnum - dy, cells);
+}
+
 static void
 pagerhist_push(HistoryBuf *self, ANSIBuf *as_ansi_buf) {
     PagerHistoryBuf *ph = self->pagerhist;
     if (!ph) return;
     Line l = {.xnum = self->xnum, .text_cache = self->text_cache};
     init_line(self, self->start_of_data, &l);
-    ANSILineState s = {.output_buf = as_ansi_buf, .bidi_open = ph->bidi_open};
+    // the oldest line
+    HistoryNeighbourRows neighbours = {.historybuf = self, .lnum = self->count - 1};
+    ANSILineState s = {.output_buf = as_ansi_buf, .bidi_open = ph->bidi_open, .neighbour_row = history_neighbour_row, .neighbour_row_ctx = &neighbours};
     as_ansi_buf->len = 0;
     const bool continued = l.cpu_cells[l.xnum - 1].next_char_was_wrapped;
     ansi_bidi_row_start(&s, &l);
@@ -347,13 +399,14 @@ pagerhist_push(HistoryBuf *self, ANSIBuf *as_ansi_buf) {
     ansi_bidi_row_end(&s, continued);
     pagerhist_write_bytes(ph, (const uint8_t *)"\x1b[m", 3);
     if (pagerhist_write_ucs4(ph, as_ansi_buf->buf, as_ansi_buf->len)) {
+        pagerhist_remember_last_line(ph, l.cpu_cells, l.xnum);
         ph->bidi_open = s.bidi_open;
         char line_end[2];
         size_t num = 0;
         line_end[num++] = '\r';
         if (!continued) line_end[num++] = '\n';
         pagerhist_write_bytes(ph, (const uint8_t *)line_end, num);
-    }
+    } else pagerhist_forget_last_line(ph); // the line is not in it
 }
 
 // Called when the history becomes empty: no history line is left to continue the paragraph the scrollback pager history ends
@@ -482,6 +535,8 @@ void
 historybuf_delete_newest_lines(HistoryBuf *self, index_type count) {
     if (!count) return;
     count = MIN(self->count, count);
+    // With no lines left, the last line of the pager history no longer adjoins the lines added after
+    if (count >= self->count && self->pagerhist) pagerhist_forget_last_line(self->pagerhist);
     self->num_pushed -= count;
     self->bidi_walked = 0;
     self->line0_cache_valid = false;
@@ -512,6 +567,8 @@ historybuf_delete_lines(HistoryBuf *self, index_type num_newer, index_type count
     if (!count || num_newer >= self->count) return;
     count = MIN(count, self->count - num_newer);
     const index_type oldest_deleted = num_newer + count - 1;
+    // The last line of the pager history no longer adjoins the oldest line when it is deleted
+    if (oldest_deleted + 1 >= self->count && self->pagerhist) pagerhist_forget_last_line(self->pagerhist);
     // Remove the parts of multicell chars that are cut by the deletion: those
     // that start above the deleted lines and extend into them...
     init_line(self, index_of(self, oldest_deleted), self->line);
@@ -618,11 +675,13 @@ as_ansi(HistoryBuf *self, PyObject *callback) {
 #define as_ansi_doc "as_ansi(callback) -> The contents of this buffer as ANSI escaped text. callback is called with each successive line."
     Line l = {.xnum = self->xnum, .text_cache = self->text_cache};
     ANSIBuf output = {0};
-    ANSILineState s = {.output_buf = &output};
+    HistoryNeighbourRows neighbours = {.historybuf = self};
+    ANSILineState s = {.output_buf = &output, .neighbour_row = history_neighbour_row, .neighbour_row_ctx = &neighbours};
     ansi_bidi_continue(&s, historybuf_pagerhist_bidi_open(self), false);
     // oldest first, so line number count - 1 first
     for (unsigned int i = 0; i < self->count; i++) {
         init_line(self, index_of(self, self->count - 1 - i), &l);
+        neighbours.lnum = self->count - 1 - i;
         output.len = 0;
         const bool continued = l.cpu_cells[l.xnum - 1].next_char_was_wrapped;
         ansi_bidi_row_start(&s, &l);
@@ -797,6 +856,13 @@ get_line_wrapper(void *x, int y) {
     return &glw->line;
 }
 
+static bool
+history_row_cells(void *x, int y, const CPUCell **cells) {
+    // y is the index of the line from the oldest, as for get_line_wrapper()
+    HistoryBuf *self = ((GetLineWrapper *)x)->self;
+    return historybuf_row_cells(self, (int64_t)self->count - 1 - y, cells);
+}
+
 static uint8_t
 pagerhist_bidi_above(void *x) {
     return historybuf_pagerhist_bidi_open(((GetLineWrapper *)x)->self);
@@ -807,7 +873,7 @@ as_text_history_buf(HistoryBuf *self, PyObject *args, ANSIBuf *output) {
     GetLineWrapper glw = {.self = self};
     glw.line.xnum = self->xnum;
     glw.line.text_cache = self->text_cache;
-    PyObject *ans = as_text_generic(args, &glw, get_line_wrapper, self->count, output, true, pagerhist_bidi_above, false);
+    PyObject *ans = as_text_generic(args, &glw, get_line_wrapper, history_row_cells, self->count, output, true, pagerhist_bidi_above, false);
     return ans;
 }
 
@@ -923,7 +989,13 @@ historybuf_finish_rewrap(HistoryBuf *dest, HistoryBuf *src) {
     for (index_type i = 0; i < dest->count; i++) attrptr(dest, (dest->start_of_data + i) % dest->ynum)->has_dirty_text = true;
     dest->pagerhist = src->pagerhist;
     src->pagerhist = NULL;
-    if (dest->pagerhist && dest->xnum != src->xnum && ringbuf_bytes_used(dest->pagerhist->ringbuf)) dest->pagerhist->rewrap_needed = true;
+    if (dest->pagerhist) {
+        // Its last line no longer adjoins the oldest line of the history when
+        // its lines are rewrapped or when lines that did not fit in the
+        // history were dropped while rewrapping, without being written to it
+        pagerhist_forget_last_line(dest->pagerhist);
+        if (dest->xnum != src->xnum && ringbuf_bytes_used(dest->pagerhist->ringbuf)) dest->pagerhist->rewrap_needed = true;
+    }
     pagerhist_close_bidi_if_history_empty(dest);
 }
 

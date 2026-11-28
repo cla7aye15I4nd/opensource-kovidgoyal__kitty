@@ -49,8 +49,10 @@ scroll the box of text with a touchpad or a high resolution mouse wheel::
 
     kitten mouse-demo
 
-Its source code, in :file:`tools/cmd/mouse_demo/text_area.go`, is a complete
-example of using this protocol.
+Its source code, in :file:`tools/cmd/mouse_demo/text_area.go`, together with
+:file:`tools/tui/scrolling/scroller.go`, which implements scrolling lines of
+content in a region and is also used by the diff and choose-app kittens, is a
+complete example of using this protocol.
 
 The escape code
 -----------------
@@ -340,11 +342,29 @@ Characters occupying multiple cells
    Wide characters and characters drawn using the :doc:`text sizing protocol
    <text-sizing-protocol>` that cross the edges of the rectangle into cells
    outside it are removed when the region is scrolled, as moving the cells of
-   the rectangle would tear them apart. Characters that are split by
-   scrolling, with some of their cells inside the rectangle and the others in
-   the rows kept by the terminal, are kept and drawn partially. Note that this
-   is different from images, which are never removed because they cross the
-   edges of the rectangle.
+   the rectangle would tear them apart. Note that this is different from
+   images, which are never removed because they cross the edges of the
+   rectangle. Otherwise, the terminal never removes characters because only
+   some of their cells are present: characters that are split by scrolling,
+   with some of their cells inside the rectangle and the others in the rows
+   kept by the terminal, or with the others discarded, are kept and drawn
+   partially.
+
+   A row (column) moving into the region often contains only some of the
+   cells of such a character, for example, the bottom row of a double sized
+   heading, when scrolling towards the beginning of the content, or the left
+   cell of a wide character, when scrolling a horizontally scrolling region
+   towards the end of the content. Draw only those cells, using the keys for
+   :ref:`drawing part of a character <text_sizing_parts>` of the text sizing
+   protocol, which also works for wide characters. Cells drawn next to the
+   cells of the same character kept by the terminal form a single character
+   with them. Never draw a complete character that extends out of the
+   rectangle, it would overwrite the cells outside it. Drawing the cells of a
+   character again, in the same positions, does not affect its other cells,
+   so rows containing parts of characters can be drawn again individually,
+   for example, the partially visible row at the edge of the region, as long
+   as the cells of the parts are not erased first, which would erase the
+   whole character.
 
 Selections
    Selections inside the rectangle of a region move with its cells.

@@ -137,6 +137,10 @@ ansi_bidi_continue(ANSILineState *s, uint8_t above, bool written) {
 }
 
 typedef Line *(get_line_func)(void *, int);
+// The cells of the row y of a container, in the coordinates of its get_line_func, used by as_text_generic() to write multiline
+// chars of which only some rows are present, see ANSILineState. Sets *cells to NULL when there is no such row and returns false
+// when the row is not known. The cells must stay valid while the container is not modified.
+typedef bool(container_row_func)(void *container, int y, const CPUCell **cells);
 // The record of the lines above the first one as_text_generic() writes, see ansi_bidi_continue()
 typedef uint8_t(ansi_bidi_above_func)(void *);
 void line_clear_text(Line *self, unsigned int at, unsigned int num, char_type ch);
@@ -162,8 +166,19 @@ bool unicode_in_range(
     const bool add_trailing_newline,
     const bool skip_zero_cells,
     bool skip_multiline_non_zero_lines,
+    // the rows around the line, as for ANSILineState, can be NULL
+    bool (*neighbour_row)(void *ctx, int dy, const CPUCell **cells),
+    void *neighbour_row_ctx,
     ANSIBuf *);
 PyObject *line_as_unicode(Line *, bool, ANSIBuf *);
+// As line_as_unicode() with the rows around the line, as for ANSILineState, see unicode_in_range()
+PyObject *line_as_unicode_with_rows(
+    Line *self,
+    bool skip_zero_cells,
+    bool skip_multiline_non_zero_lines,
+    bool (*neighbour_row)(void *ctx, int dy, const CPUCell **cells),
+    void *neighbour_row_ctx,
+    ANSIBuf *buf);
 
 void linebuf_init_line(LineBuf *, index_type);
 void linebuf_init_line_at(LineBuf *, index_type, Line *);
@@ -193,6 +208,7 @@ void historybuf_init_line(HistoryBuf *self, index_type num, Line *l);
 bool historybuf_init_line_for_render(HistoryBuf *self, index_type lnum, Line *l, index_type num_rows);
 bool history_buf_endswith_wrap(HistoryBuf *self);
 CPUCell *historybuf_cpu_cells(HistoryBuf *self, index_type num);
+bool historybuf_row_cells(HistoryBuf *self, int64_t lnum, const CPUCell **cells);
 LineAttrs *historybuf_attrs(HistoryBuf *self, index_type num);
 void historybuf_mark_line_clean(HistoryBuf *self, index_type y);
 void historybuf_mark_line_dirty(HistoryBuf *self, index_type y);
@@ -206,6 +222,7 @@ PyObject *as_text_generic(
     PyObject *args,
     void *container,
     get_line_func get_line,
+    container_row_func *row_cells,
     index_type lines,
     ANSIBuf *ansibuf,
     bool add_trailing_newline,

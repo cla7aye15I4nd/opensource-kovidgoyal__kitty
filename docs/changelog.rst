@@ -158,7 +158,15 @@ Detailed list of changes
 - A new :doc:`smooth scrolling protocol <smooth-scrolling-protocol>` that lets
   programs define up to four rectangular regions of the screen that the
   terminal scrolls, vertically or horizontally, by amounts in pixels, with
-  images moving along with the text
+  images moving along with the text. The :doc:`diff </kittens/diff>` and
+  :doc:`choose-app </kittens/choose-app>` kittens use it to scroll smoothly,
+  pixel by pixel, with touchpads and high resolution mouse wheels
+
+- :doc:`Text sizing protocol </text-sizing-protocol>`: Allow programs to
+  :ref:`draw only part of a character <text_sizing_parts>` occupying multiple
+  cells, for example, only the bottom row of a large heading or one cell of a
+  wide character, so that such characters can be scrolled into smooth scroll
+  regions row by row and column by column
 
 - A new mode (``5523``) to :ref:`report all mouse events to programs in full
   detail <detailed_mouse_events>`, in an encoding that is valid ECMA-48, unlike
@@ -220,6 +228,10 @@ Detailed list of changes
 
 - Remote control: Automatically remove stale UNIX sockets left behind by a
   killed kitty instance when using :option:`kitty --listen-on`
+
+- Fix adjacent characters drawn with an explicit width using the
+  :doc:`text sizing protocol <text-sizing-protocol>` being merged into a single
+  character in the scrollback pager and when copying as ANSI text
 
 - Fix DIM/FAINT text under a block cursor that uses a fixed
   :opt:`cursor_text_color` being hard to read. Such text is now drawn
@@ -311,6 +323,11 @@ Detailed list of changes
 
 - Include the Python type stub (``.pyi``) files in the installed package, for
   better editor integration (:iss:`10955`)
+
+- Sessions: Windows that were not created in a session now belong to the
+  session of their tab when matching ``session:`` in :ref:`search expressions
+  <search_syntax>`, closing a session and choosing sessions. This fixes
+  ``save_as_session --match=session:.`` leaving out such windows (:pull:`10956`)
 
 0.51.1 [2026-11-23]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

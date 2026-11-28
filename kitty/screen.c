@@ -270,7 +270,6 @@ do_screen_reset(Screen *self, bool is_hard_reset) {
         bidi_layout_moved(self);
         // all buffers are now empty
         self->multiline_chars_used = false;
-        zero_at_ptr(&self->multiline_chars_cut_off_at_bottom);
         self->last_visited_prompt.is_set = false;
         self->scrolled_by = 0;
         self->pixel_scroll_offset_y = 0;
@@ -793,38 +792,37 @@ nuke_multiline_char_intersecting_with(Screen *self, index_type x_start, index_ty
     }
 }
 
-static bool *
-multiline_chars_cut_off_at_bottom(Screen *self) {
-    return self->multiline_chars_cut_off_at_bottom + (self->linebuf == self->alt_linebuf ? 1 : 0);
-}
-
 static void
-nuke_multiline_chars_extending_below(Screen *self, index_type bottom) {
-    // Remove chars extending below the line bottom when a new line is about to come in below it, tearing
-    // them. When bottom is the last line of the screen these are chars cut off at the bottom of the screen.
-    bool *cut_off = multiline_chars_cut_off_at_bottom(self);
-    const bool at_screen_bottom = bottom + 1 >= self->lines;
-    if (at_screen_bottom && !*cut_off) return;
-    const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, bottom);
-    if (cells_have_multiline_chars(cp, self->columns)) {
-        for (index_type x = 0; x < self->columns; x++) {
-            if (cp[x].is_multicell && cp[x].y + 1u < cp[x].scale) nuke_multicell_char_at(self, x, bottom, false);
-        }
+nuke_multiline_chars_crossing(Screen *self, int upper) {
+    // Remove the multiline chars that continue from the range line upper into
+    // the line below it, which is on the screen, as an operation is about to
+    // separate the two lines, tearing them. Must be called before the lines
+    // are moved. Only the chars actually continuing are removed, rather than
+    // trusting the y and scale of cells, as chars can be partial.
+    const int lower = upper + 1;
+    if (!self->multiline_chars_used || lower < 0 || lower >= (int)self->lines) return;
+    const CPUCell *above;
+    if (upper >= 0) above = linebuf_cpu_cells_for_line(self->linebuf, upper);
+    else if (self->linebuf == self->main_linebuf && -upper <= (int)self->historybuf->count) above = historybuf_cpu_cells(self->historybuf, -(upper + 1));
+    else return;
+    const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, lower);
+    if (!cells_have_multiline_chars(cp, self->columns)) return;
+    for (index_type x = 0; x < self->columns; x++) {
+        if (cp[x].is_multicell && cp[x].y && continues_multicell_char(above + x, cp + x, cp[x].y - 1u)) nuke_multicell_char_at(self, x, lower, false);
     }
-    if (at_screen_bottom) *cut_off = false;
 }
 
 static void
 nuke_multiline_chars_torn_by_scroll(Screen *self, index_type top, index_type bottom, bool up, bool history_adjoins_top) {
-    // Scrolling the region [top, bottom] moves its lines by one, removing the line
-    // at one edge and bringing a new line in at the other. Multiline chars
-    // that end up cut off at the edge of the screen (or of the history buffer)
-    // are left alone, they are partially scrolled off and are rendered as
-    // such. Chars that would end up torn, with the rows adjacent to the
-    // remaining part of the char being from unrelated lines, are removed.
-    // history_adjoins_top must be true when the line removed from (up) or
-    // brought into (down) the top of the region is moved into or out of the
-    // history buffer.
+    // Scrolling the region [top, bottom] moves its lines by one, removing the
+    // line at one edge and bringing a new line in at the other. Multiline
+    // chars that end up cut off at the edge of the screen (or of the history
+    // buffer) are left alone, they are partially scrolled off and are
+    // rendered as such, as are chars of which only some rows were present
+    // before. Chars that would be torn, with some of their rows removed or
+    // separated from the others, are removed. history_adjoins_top must be
+    // true when the line removed from (up) or brought into (down) the top of
+    // the region is moved into or out of the history buffer.
     if (!self->multiline_chars_used || top >= bottom || bottom >= self->lines) return;
 #define has_multiline(y) cells_have_multiline_chars(linebuf_cpu_cells_for_line(self->linebuf, y), self->columns)
     if (up) {
@@ -834,24 +832,15 @@ nuke_multiline_chars_torn_by_scroll(Screen *self, index_type top, index_type bot
         // history line.
         const bool at_edge = top == 0 && (history_adjoins_top || self->linebuf == self->alt_linebuf);
         if (!at_edge && has_multiline(top)) nuke_multiline_char_intersecting_with(self, 0, self->columns, top, top + 1, false);
-        // A new line comes in at the bottom
-        nuke_multiline_chars_extending_below(self, bottom);
+        // A new line comes in at the bottom, separating the chars crossing the bottom edge of the region
+        nuke_multiline_chars_crossing(self, (int)bottom);
     } else {
         // The bottom line is removed, cutting chars at the edge of the screen
-        // if it is the last line of the screen. Rather than scanning for such
-        // chars here, the flag is set unconditionally, the next scroll up scans
-        // for them once and clears it.
-        if (bottom + 1 < self->lines) {
-            if (has_multiline(bottom)) nuke_multiline_char_intersecting_with(self, 0, self->columns, bottom, bottom + 1, false);
-        } else *multiline_chars_cut_off_at_bottom(self) = true;
-        // A new line comes in at the top, tearing chars that extend above the
-        // top line unless the new line is the history line above the top line
-        if (!(top == 0 && history_adjoins_top) && has_multiline(top)) {
-            const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, top);
-            for (index_type x = 0; x < self->columns; x++) {
-                if (cp[x].is_multicell && cp[x].y > 0) nuke_multicell_char_at(self, x, top, false);
-            }
-        }
+        // if it is the last line of the screen
+        if (bottom + 1 < self->lines && has_multiline(bottom)) nuke_multiline_char_intersecting_with(self, 0, self->columns, bottom, bottom + 1, false);
+        // A new line comes in at the top, separating the chars crossing the
+        // top edge of the region, unless it is the history line above them
+        if (!(top == 0 && history_adjoins_top)) nuke_multiline_chars_crossing(self, (int)top - 1);
     }
 #undef has_multiline
 }
@@ -1260,55 +1249,6 @@ ssr_nuke_straddling_chars(Screen *self, SmoothScrollRegion *r) {
     }
 }
 
-static void
-ssr_nuke_chars_next_to_blank_row(Screen *self, SmoothScrollRegion *r, index_type y, bool blank_row_is_below) {
-    // A blank row has come in next to row y of the rectangle, tearing the multiline chars that extend into it
-    if (!self->multiline_chars_used || y < r->top || y >= r->bottom) return;
-    for (index_type x = r->left; x < r->right; x++) {
-        const CPUCell c = linebuf_cpu_cells_for_line(self->linebuf, y)[x];
-        if (c.is_multicell && (blank_row_is_below ? c.y + 1u < c.scale : c.y > 0)) nuke_multicell_char_at(self, x, y, false);
-    }
-}
-
-static void
-ssr_nuke_chars_next_to_blank_column(Screen *self, SmoothScrollRegion *r, index_type x, bool blank_column_is_right) {
-    // A blank column has come in next to column x of the rectangle, tearing the multicell chars that extend into it
-    if (x < r->left || x >= r->right) return;
-    for (index_type y = r->top; y < r->bottom; y++) {
-        const CPUCell c = linebuf_cpu_cells_for_line(self->linebuf, y)[x];
-        if (c.is_multicell && (blank_column_is_right ? c.x + 1u < mcd_x_limit(&c) : c.x > 0)) nuke_multicell_char_at(self, x, y, false);
-    }
-}
-
-static void
-ssr_nuke_chars_continuing_into_overflow(Screen *self, SmoothScrollRegion *r, bool before) {
-    // The overflow buffer is about to be discarded, tearing the multicell chars at the edge of the rectangle that continue into it
-    if (!(before ? r->num_before : r->num_after)) return;
-    if (r->horizontal) {
-        const index_type x = before ? r->left : r->right - 1, col = ssr_nearest_column(r, before);
-        for (index_type y = r->top; y < r->bottom; y++) {
-            const CPUCell c = linebuf_cpu_cells_for_line(self->linebuf, y)[x];
-            if (!c.is_multicell) continue;
-            CPUCell *oc;
-            RenderCell *orc;
-            ssr_overflow_row_cells(r, before, y - r->top, &oc, &orc);
-            if (before ? (c.x > 0 && continues_multicell_char_horizontally(oc + col, &c, c.x - 1))
-                       : (c.x + 1u < mcd_x_limit(&c) && continues_multicell_char_horizontally(oc + col, &c, c.x + 1)))
-                nuke_multicell_char_at(self, x, y, false);
-        }
-        return;
-    }
-    if (!self->multiline_chars_used) return;
-    const index_type y = before ? r->top : r->bottom - 1;
-    const CPUCell *nearest = ssr_overflow_cells(r, ssr_slot(r, before, 0));
-    for (index_type x = r->left; x < r->right; x++) {
-        const CPUCell c = linebuf_cpu_cells_for_line(self->linebuf, y)[x];
-        if (!c.is_multicell) continue;
-        if (before ? (c.y > 0 && continues_multicell_char(nearest + x - r->left, &c, c.y - 1))
-                   : (c.y + 1u < c.scale && continues_multicell_char(nearest + x - r->left, &c, c.y + 1)))
-            nuke_multicell_char_at(self, x, y, false);
-    }
-}
 // }}}
 
 static void
@@ -1429,7 +1369,6 @@ ssr_shift_by_one_row(Screen *self, SmoothScrollRegion *r, bool up) {
             ssr_copy_slot_to_row(self, r, ssr_slot(r, false, 0), last);
             ssr_pop_slot(r, false);
         }
-        if (entered_blank && last > top) ssr_nuke_chars_next_to_blank_row(self, r, last - 1, true);
     } else {
         // The bottom row leaves, a row enters at the top
         ssr_copy_row_to_slot(self, r, last, ssr_push_slot(r, false));
@@ -1456,7 +1395,6 @@ ssr_shift_by_one_row(Screen *self, SmoothScrollRegion *r, bool up) {
             entered_blank = false;
         }
         if (entered_blank) ssr_blank_row(self, r, top);
-        if (entered_blank && last > top) ssr_nuke_chars_next_to_blank_row(self, r, top + 1, false);
     }
     ssr_move_images(self, r, up, via_history);
     if (UNLIKELY(self->linebuf->bidi_stamped)) {
@@ -1554,7 +1492,6 @@ ssr_shift_by_one_column(Screen *self, SmoothScrollRegion *r, bool left) {
     index_type *pushed = left ? &r->num_before : &r->num_after, *popped = left ? &r->num_after : &r->num_before;
     if (*pushed < k) (*pushed)++;
     if (*popped) (*popped)--;
-    if (entered_blank && w > 1) ssr_nuke_chars_next_to_blank_column(self, r, left ? last - 1 : first + 1, left);
     ssr_move_images(self, r, left, false);
     if (UNLIKELY(stamped)) bidi_layout_moved(self);
     self->is_dirty = true;
@@ -1576,8 +1513,6 @@ static void
 ssr_discard_overflow(Screen *self, SmoothScrollRegion *r) {
     // The rows (columns) in the rectangle no longer adjoin the rows (columns)
     // in the overflow buffers, so discard them and render the rectangle unshifted
-    ssr_nuke_chars_continuing_into_overflow(self, r, true);
-    ssr_nuke_chars_continuing_into_overflow(self, r, false);
     ssr_clear_overflow(r, true);
     ssr_clear_overflow(r, false);
     ssr_release_images(self, r, !ssr_uses_history(self, r));
@@ -1753,7 +1688,6 @@ ssr_lines_moved(Screen *self, index_type top, index_type bottom, bool up, bool v
         if (up && via_history && top == 0 && bottom + 1 >= r->bottom && ssr_uses_history(self, r)) {
             // The top row of the rectangle moves into the scrollback
             r->pushed_to_history = MIN(r->pushed_to_history + 1, self->historybuf->ynum);
-            ssr_nuke_chars_continuing_into_overflow(self, r, false);
             ssr_clear_overflow(r, false);
             ssr_release_images(self, r, false);
             if (r->offset < 0) {
@@ -1887,20 +1821,20 @@ screen_prepare_smooth_scroll_render(Screen *self) {
 }
 
 static void
-ssr_render_line_if_dirty(Screen *self, Line *line, FONTS_DATA_HANDLE fonts_data, const Cursor *cursor, BidiMaps *b, bool fixed) {
+ssr_render_line_if_dirty(Screen *self, Line *line, FONTS_DATA_HANDLE fonts_data, BidiMaps *b, bool fixed) {
     // Render a line that is drawn only in the strip of a region. It is never the cursor row. In a frame with bidi maps it is
     // rendered at the levels bidi_strip_line_levels() gives, which are stored for the order of its strip row.
     if (!line->attrs.has_dirty_text) return;
     const uint8_t *levels = UNLIKELY(b) ? bidi_strip_line_levels(b, line, fixed) : NULL;
-    render_line(fonts_data, line, self->lines, (Cursor *)cursor, self->disable_ligatures, self->lc, levels);
+    render_line(fonts_data, line, self->lines, NULL, self->disable_ligatures, self->lc, levels);
     if (UNLIKELY(self->bidi_maps)) bidi_store_line_levels(line, levels);
     if (screen_has_marker(self)) mark_text_in_line(self->marker, line, &self->as_ansi_buf);
 }
 
 static void
-ssr_render_overflow_line(Screen *self, SmoothScrollRegion *r, index_type y, Line *line, FONTS_DATA_HANDLE fonts_data, const Cursor *cursor, BidiMaps *b) {
+ssr_render_overflow_line(Screen *self, SmoothScrollRegion *r, index_type y, Line *line, FONTS_DATA_HANDLE fonts_data, BidiMaps *b) {
     linebuf_init_line_at(r->overflow, y, line);
-    ssr_render_line_if_dirty(self, line, fonts_data, cursor, b, false);
+    ssr_render_line_if_dirty(self, line, fonts_data, b, false);
     linebuf_mark_line_clean(r->overflow, y);
 }
 
@@ -1924,7 +1858,6 @@ ssr_update_strip_cell_data(Screen *self, uint8_t *address, FONTS_DATA_HANDLE fon
     // Write the cells of the strips of the shifted regions, see SmoothScrollRenderRegion
     const SmoothScrollRender *sr = &self->smooth_scroll_render;
     const bool paused = self->paused_rendering.expires_at != 0;
-    const Cursor *cursor = paused ? &self->paused_rendering.cursor : self->cursor;
     LineBuf *lb = paused ? self->paused_rendering.linebuf : self->linebuf;
     const index_type row_offset = paused ? (index_type)paused_snapshot_row_offset(self) : 0;
     Line line = {.text_cache = self->text_cache};
@@ -1941,7 +1874,7 @@ ssr_update_strip_cell_data(Screen *self, uint8_t *address, FONTS_DATA_HANDLE fon
                 for (int edge = 0; edge < 2; edge++) {
                     const bool before = edge == 0;
                     const index_type n = before ? r->num_before : r->num_after;
-                    ssr_render_overflow_line(self, r, before ? y : rr->height + y, &line, fonts_data, cursor, NULL);
+                    ssr_render_overflow_line(self, r, before ? y : rr->height + y, &line, fonts_data, NULL);
                     ssr_write_strip_cells(b, n ? &line : NULL, ssr_nearest_column(r, before), 1, row + (before ? 0 : w + 1));
                 }
                 linebuf_init_line_at(lb, rr->top + y + row_offset, &line);
@@ -1958,7 +1891,7 @@ ssr_update_strip_cell_data(Screen *self, uint8_t *address, FONTS_DATA_HANDLE fon
                 if (paused) {
                     LineBuf *hr = self->paused_rendering.smooth_scroll.history_row;
                     linebuf_init_line_at(hr, 0, &line);
-                    ssr_render_line_if_dirty(self, &line, fonts_data, cursor, b, !self->paused_rendering.pixel_scroll);
+                    ssr_render_line_if_dirty(self, &line, fonts_data, b, !self->paused_rendering.pixel_scroll);
                     linebuf_mark_line_clean(hr, 0);
                     lp = &line;
                 } else if (self->historybuf->count) {
@@ -1967,14 +1900,14 @@ ssr_update_strip_cell_data(Screen *self, uint8_t *address, FONTS_DATA_HANDLE fon
                     // With pixel scrolling the line is on view, rendered at its levels. Without, it is drawn as with bidi mode
                     // off and stays dirty, so that a frame showing it on view does not take those levels as its own.
                     const bool fixed = !pixel_scroll_enabled(self);
-                    ssr_render_line_if_dirty(self, &line, fonts_data, cursor, b, fixed);
+                    ssr_render_line_if_dirty(self, &line, fonts_data, b, fixed);
                     if (UNLIKELY(b) && fixed) historybuf_mark_line_dirty(self->historybuf, 0);
                     else historybuf_mark_line_clean(self->historybuf, 0);
                     lp = &line;
                 }
                 x = rr->left;
             } else if (before ? r->num_before : r->num_after) {
-                ssr_render_overflow_line(self, r, ssr_slot(r, before, 0), &line, fonts_data, cursor, b);
+                ssr_render_overflow_line(self, r, ssr_slot(r, before, 0), &line, fonts_data, b);
                 lp = &line;
             }
             ssr_write_strip_cells(b, lp, x, w, row);
@@ -3137,6 +3070,18 @@ move_cursor_past_multicell(Screen *self, index_type required_width) {
 }
 
 static void
+move_cursor_to_fit(Screen *self, index_type required_width) {
+    // Move the cursor so that required_width cells fit in the line after it,
+    // to the next line or back, as for any char, but, unlike
+    // move_cursor_past_multicell(), never past the lower rows of multiline
+    // chars. Used for parts of chars, which are drawn exactly where requested,
+    // removing the chars in the way.
+    if (self->cursor->x + required_width <= self->columns) return;
+    if (self->modes.mDECAWM && linefeed_moves_to_new_line(self)) continue_to_next_line(self);
+    else self->cursor->x = required_width > self->columns ? 0 : self->columns - required_width;
+}
+
+static void
 move_widened_char_past_multiline_chars(Screen *self, text_loop_state *s, CPUCell *cp, index_type xpos, index_type ypos, index_type old_width, CPUCell c) {
     // Move the char, of old_width cells starting at xpos in the line ypos, whose
     // cells are cp, to the first place at or after it with enough room for it at
@@ -3890,10 +3835,45 @@ multicell_may_reorder(unsigned scale, const ListOfChars *lc) {
     return false;
 }
 
+// The rectangle of the block of a multicell char that is drawn, see the
+// "Drawing part of a character" section of docs/text-sizing-protocol.rst
+typedef struct MulticellPart {
+    index_type x, y, columns, rows;
+} MulticellPart;
+
+static bool
+is_same_cell_of_char(const CPUCell *c, const CPUCell *mcd) {
+    // Whether c is the cell of the char mcd at the position of mcd in its block
+    return continues_multicell_char_horizontally(c, mcd, mcd->x);
+}
+
+static bool
+span_has_same_cells_of_char(Screen *self, CPUCell mcd, const MulticellPart *part) {
+    // Whether the cells at the cursor, where part of the char mcd is about to
+    // be drawn, already are those cells of the char
+    if (self->cursor->x + part->columns > self->columns || self->cursor->y + part->rows > self->lines) return false;
+    for (index_type r = 0; r < part->rows; r++) {
+        const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, self->cursor->y + r);
+        mcd.y = part->y + r;
+        mcd.x = part->x;
+        for (index_type c = 0; c < part->columns; c++, mcd.x++) {
+            if (!is_same_cell_of_char(cp + self->cursor->x + c, &mcd)) return false;
+        }
+    }
+    return true;
+}
+
 static void
-handle_fixed_width_multicell_command(Screen *self, CPUCell mcd, ListOfChars *lc) {
-    index_type width = mcd.width * mcd.scale;
-    index_type height = mcd.scale;
+handle_fixed_width_multicell_command(Screen *self, CPUCell mcd, ListOfChars *lc, const MulticellPart *part) {
+    // Draw the cells of the multicell char mcd in part of its block, or all of
+    // them when part is NULL
+    const MulticellPart whole = {.columns = mcd.width * mcd.scale, .rows = mcd.scale};
+    // Parts are drawn exactly where requested, unlike complete chars, which
+    // are moved past the lower rows of multiline chars in their way
+    const bool is_part = part != NULL;
+    if (!part) part = &whole;
+    index_type width = part->columns;
+    index_type height = part->rows;
     index_type max_height = self->margin_bottom - self->margin_top + 1;
     if (width > self->columns || height > max_height) return;
     lc->count = MIN(lc->count, MAX_NUM_CODEPOINTS_PER_CELL);
@@ -3908,7 +3888,10 @@ handle_fixed_width_multicell_command(Screen *self, CPUCell mcd, ListOfChars *lc)
     if (UNLIKELY(self->linebuf->bidi_stamped)) {
         for (index_type y = first_row; y < MIN(first_row + height, self->lines); y++) bidi_line_gets_text(self, y);
     }
-    move_cursor_past_multicell(self, width);
+    // Cells drawn over the same cells of the same char replace them in place,
+    // they are neither skipped, as lower rows of a multiline char, nor removed
+    if (is_part) move_cursor_to_fit(self, width);
+    else if (!span_has_same_cells_of_char(self, mcd, part)) move_cursor_past_multicell(self, width);
     const bool moved_to_other_rows = self->cursor->y != first_row;
     if (height > 1) {
         if (self->cursor->y <= self->margin_bottom) {
@@ -3943,10 +3926,13 @@ handle_fixed_width_multicell_command(Screen *self, CPUCell mcd, ListOfChars *lc)
             record_written_line(self, y, current_bidi_record(self).val);
             bidi_note_may_reorder(self, y, may_reorder);
         }
-        mcd.x = 0;
-        mcd.y = y - self->cursor->y;
+        mcd.x = part->x;
+        mcd.y = part->y + (y - self->cursor->y);
         for (index_type x = self->cursor->x; x < self->cursor->x + width; x++, mcd.x++) {
-            if (s.cp[x].is_multicell) nuke_multicell_char_at(self, x, y, s.cp[x].x + s.cp[x].y > 0);
+            // Drawing the cells of a char over the same cells of the same char
+            // replaces them without removing its other cells, so that programs
+            // can draw the rows of a char, or parts of it, again individually
+            if (s.cp[x].is_multicell && !is_same_cell_of_char(s.cp + x, &mcd)) nuke_multicell_char_at(self, x, y, s.cp[x].x + s.cp[x].y > 0);
             s.cp[x] = mcd;
         }
     }
@@ -3963,7 +3949,7 @@ handle_variable_width_multicell_command(Screen *self, CPUCell mcd, ListOfChars *
         lc->count = 0;
         return;
     }
-    handle_fixed_width_multicell_command(self, mcd, lc);
+    handle_fixed_width_multicell_command(self, mcd, lc, NULL);
 }
 
 void
@@ -3983,8 +3969,23 @@ screen_handle_multicell_command(Screen *self, const MultiCellCommand *cmd, const
         .halign = MIN(cmd->horizontal_align, M(HALIGN_BITS)),
         .is_multicell = true};
 #undef M
+    if (cmd->part_x || cmd->part_y || cmd->part_columns || cmd->part_rows) {
+        // Drawing part of the block of the char, which must be inside it
+        if (!mcd.width || cmd->width != mcd.width || cmd->scale > mcd.scale) return;
+        const index_type block_width = mcd.width * mcd.scale, block_height = mcd.scale;
+        if (cmd->part_x >= block_width || cmd->part_y >= block_height) return;
+        MulticellPart part = {
+            .x = cmd->part_x,
+            .y = cmd->part_y,
+            .columns = cmd->part_columns ? cmd->part_columns : block_width - cmd->part_x,
+            .rows = cmd->part_rows ? cmd->part_rows : block_height - cmd->part_y};
+        if (cmd->part_columns > block_width - part.x || cmd->part_rows > block_height - part.y) return;
+        if (mcd.scale > 1) self->multiline_chars_used = true;
+        handle_fixed_width_multicell_command(self, mcd, self->lc, &part);
+        return;
+    }
     if (mcd.scale > 1) self->multiline_chars_used = true;
-    if (mcd.width) handle_fixed_width_multicell_command(self, mcd, self->lc);
+    if (mcd.width) handle_fixed_width_multicell_command(self, mcd, self->lc, NULL);
     else {
         RAII_ListOfChars(lc);
         GraphemeSegmentationResult s;
@@ -5678,15 +5679,14 @@ screen_insert_lines(Screen *self, unsigned int count) {
     unsigned int top = self->margin_top, bottom = self->margin_bottom;
     if (count == 0) count = 1;
     if (top <= self->cursor->y && self->cursor->y <= bottom) {
-        // remove split multiline chars at top edge
-        CPUCell *cells = linebuf_cpu_cells_for_line(self->linebuf, self->cursor->y);
-        for (index_type x = 0; x < self->columns; x++) {
-            if (cells[x].is_multicell && cells[x].y) nuke_multicell_char_at(self, x, self->cursor->y, false);
-        }
-        const bool at_screen_bottom = bottom + 1 >= self->lines;
-        // remove chars straddling the bottom margin, as the lines at the bottom
-        // of the region are pushed out, tearing them
-        if (self->multiline_chars_used && !at_screen_bottom) nuke_multiline_chars_extending_below(self, bottom);
+        // remove multiline chars split at the cursor line
+        nuke_multiline_chars_crossing(self, (int)self->cursor->y - 1);
+        // and at the bottom of the region, chars crossing the bottom margin,
+        // and chars whose lower rows are pushed out of the region, except at
+        // the bottom of the screen, where they are partially scrolled off, as
+        // when scrolling down
+        nuke_multiline_chars_crossing(self, (int)bottom);
+        if (bottom + 1 < self->lines && (int64_t)bottom >= (int64_t)self->cursor->y + count) nuke_multiline_chars_crossing(self, (int)(bottom - count));
         if (UNLIKELY(self->smooth_scroll.count)) ssr_lines_moved(self, self->cursor->y, bottom, false, false);
         screen_dirty_line_graphics(self, top, bottom, self->linebuf == self->main_linebuf);
         linebuf_insert_lines(self->linebuf, count, self->cursor->y, bottom);
@@ -5702,13 +5702,6 @@ screen_insert_lines(Screen *self, unsigned int count) {
         self->is_dirty = true;
         clear_all_selections(self);
         screen_carriage_return(self);
-        if (self->multiline_chars_used) {
-            // Chars whose lower rows were pushed out of the region are now cut
-            // off at its bottom. At the bottom of the screen they are partially
-            // scrolled off, as when scrolling down, otherwise they are torn.
-            if (at_screen_bottom) *multiline_chars_cut_off_at_bottom(self) = true;
-            else nuke_multiline_chars_extending_below(self, bottom);
-        }
     }
 }
 
@@ -5732,13 +5725,11 @@ static void
 screen_delete_lines_impl(Screen *self, index_type start, index_type count, index_type top, index_type bottom) {
     index_type y = start;
     if (UNLIKELY(self->smooth_scroll.count)) ssr_lines_moved(self, start, bottom, true, false);
+    // remove the multiline chars intersecting the deleted lines [start, start + count)
     nuke_multiline_char_intersecting_with(self, 0, self->columns, y, y + 1, false);
-    y += count;
-    y = MIN(bottom, y);
-    nuke_multiline_char_intersecting_with(self, 0, self->columns, y, y + 1, false);
-    // blank lines come in at the bottom, tearing chars that extend below it, which
-    // includes chars that are cut off at the bottom of the screen
-    if (self->multiline_chars_used) nuke_multiline_chars_extending_below(self, bottom);
+    if ((int64_t)start + count <= (int64_t)bottom) nuke_multiline_chars_crossing(self, (int)(start + count - 1));
+    // blank lines come in at the bottom, separating the chars crossing the bottom margin
+    nuke_multiline_chars_crossing(self, (int)bottom);
     screen_dirty_line_graphics(self, top, bottom, self->linebuf == self->main_linebuf);
     linebuf_delete_lines(self->linebuf, count, start, bottom);
     if (UNLIKELY(self->linebuf->bidi_stamped)) {
@@ -7039,6 +7030,43 @@ screen_line_for_cursor(Screen *self, index_type x, index_type y, Line *overlay_l
     return overlay_line;
 }
 
+static bool range_row_cells(Screen *self, int y, const CPUCell **cells);
+
+static const CPUCell *
+scrollback_row_cells(Screen *self, int y) {
+    // The cells of range line y, NULL when it is not in the screen or the
+    // scrollback. Unlike range_row_cells() the row above the scrollback, the
+    // last line of the pager history, is not included, as it cannot be
+    // displayed or selected.
+    if (y < -(int)self->historybuf->count) return NULL;
+    const CPUCell *cells;
+    return range_row_cells(self, y, &cells) ? cells : NULL;
+}
+
+static const CPUCell *
+rendered_row_cells(Screen *self, int y) {
+    // The cells of range line y as rendered, from the snapshot while rendering
+    // is paused, NULL when there is no such row. Unlike the lines, getting
+    // them does not change the shared line objects.
+    if (self->paused_rendering.expires_at) {
+        const int row = y + paused_snapshot_row_offset(self);
+        if (row < 0 || row >= (int)self->paused_rendering.linebuf->ynum) return NULL;
+        return linebuf_cpu_cells_for_line(self->paused_rendering.linebuf, (index_type)row);
+    }
+    return scrollback_row_cells(self, y);
+}
+
+static bool
+multicell_char_continues_from_row_above_for_cursor(Screen *self, const CPUCell *ref, index_type x, index_type y) {
+    // Whether the multicell char whose cell, as rendered, at (x, y) in linebuf
+    // coordinates is ref continues from the row above, rather than that row
+    // being the top row of the part of it present. Does not change the shared
+    // line objects, so the line returned by screen_line_for_cursor() stays valid.
+    if (!ref->is_multicell || !ref->y) return false;
+    const CPUCell *above = rendered_row_cells(self, (int)y - 1);
+    return above && continues_multicell_char(above + x, ref, ref->y - 1u);
+}
+
 index_type
 screen_multicell_char_rows_for_cursor(Screen *self, const CPUCell *ref, index_type x, index_type y) {
     // The number of rows, from row y down, of the multicell char whose cell,
@@ -7062,6 +7090,42 @@ screen_multicell_char_rows_for_cursor(Screen *self, const CPUCell *ref, index_ty
     }
     return n;
 }
+
+static RenderCursor
+render_cursor_for(Screen *self, const Cursor *cursor) {
+    // The cursor with the rows of the char under it, as rendered, only those
+    // present, as it can be partial, see RenderCursor
+    RenderCursor ans = {.cursor = cursor, .char_top = cursor->y, .char_limit = cursor->y + 1};
+    if (cursor->x >= self->columns || cursor->y >= self->lines) return ans;
+    const CPUCell *cells = rendered_row_cells(self, (int)cursor->y);
+    if (!cells || !cells[cursor->x].is_multicell) return ans;
+    const CPUCell *c = cells + cursor->x;
+    for (index_type k = 1; k <= c->y && k <= cursor->y; k++) {
+        const CPUCell *above = rendered_row_cells(self, (int)(cursor->y - k));
+        if (!above || !continues_multicell_char(above + cursor->x, c, c->y - k)) break;
+        ans.char_top = cursor->y - k;
+    }
+    ans.char_limit = cursor->y + screen_multicell_char_rows_for_cursor(self, c, cursor->x, cursor->y);
+    return ans;
+}
+
+bool
+screen_large_cursor_extent(Screen *self, const Line *line, index_type x, index_type y, index_type *num_rows, index_type *num_cols) {
+    // Whether a cursor at (x, y) in linebuf coordinates, whose line as
+    // rendered is line, is large, covering the num_rows by num_cols cells of
+    // a multicell char. It is large in the top left cell of the part of the
+    // char present, which covers only the cells present, as a char can be cut
+    // off at the edges of the screen, split by a smooth scroll region, with
+    // its other cells in the overflow buffers, or drawn partially.
+    const CPUCell *c = line->cpu_cells + x;
+    if (!c->is_multicell) return false;
+    const MulticellColumns cols = multicell_char_columns(line->cpu_cells, line->xnum, x);
+    if (cols.start != x || multicell_char_continues_from_row_above_for_cursor(self, c, x, y)) return false;
+    *num_rows = screen_multicell_char_rows_for_cursor(self, c, x, y);
+    *num_cols = cols.limit - x;
+    return true;
+}
+
 
 // Bidi upload {{{
 static bool
@@ -7194,6 +7258,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
             // The map of the pause: no upload runs while paused
             BidiMaps *b = UNLIKELY(linebuf->bidi_stamped) ? bidi_maps_for_upload(self, linebuf, linebuf->ynum) : NULL;
             if (!b && self->bidi_maps) self->bidi_maps->valid = self->bidi_maps->reusable = false;
+            const RenderCursor render_cursor = render_cursor_for(self, &self->paused_rendering.cursor);
             for (index_type y = 0; y < linebuf->ynum; y++) {
                 linebuf_init_line(linebuf, y);
                 const uint8_t *levels = NULL;
@@ -7202,7 +7267,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
                 if (linebuf->line->attrs.has_dirty_text || relevel) {
                     // The extra leading row and scrollback rows are never the cursor row
                     const index_type lnum = (int)y < row_offset ? self->lines : y - (index_type)row_offset;
-                    render_line(fonts_data, linebuf->line, lnum, &self->paused_rendering.cursor, self->disable_ligatures, self->lc, levels);
+                    render_line(fonts_data, linebuf->line, lnum, &render_cursor, self->disable_ligatures, self->lc, levels);
                     if (UNLIKELY(b)) bidi_store_levels(b, y, linebuf->line);
                     // Cell images are not rendered here: this would modify the live grman using snapshot row numbers
                     if (linebuf->line->attrs.has_dirty_text && screen_has_marker(self)) mark_text_in_line(self->marker, linebuf->line, &self->as_ansi_buf);
@@ -7231,6 +7296,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
     const uint8_t *levels = NULL;
     const uint16_t *v2l = NULL;
     bool relevel = false;
+    const RenderCursor render_cursor = render_cursor_for(self, self->cursor);
     for (unsigned int render_row = 0; render_row < render_lines; render_row++) {
         const int virtual_y = (int)render_row - render_row_offset;
         bool is_history = false;
@@ -7250,7 +7316,8 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
             // the unicode placeholder was first scanned can alter it.
             screen_render_line_graphics(self, linep, virtual_y - (int)self->scrolled_by);
             if (force_history_render || linep->attrs.has_dirty_text || relevel) {
-                render_line(fonts_data, linep, lnum, self->cursor, self->disable_ligatures, self->lc, levels);
+                // the lines of the history are not rows of the char under the cursor, which is on the screen
+                render_line(fonts_data, linep, lnum, NULL, self->disable_ligatures, self->lc, levels);
                 if (UNLIKELY(mapped)) bidi_store_levels(b, render_row, linep);
 #ifdef DEBUG
                 else if (b) bidi_check_unmapped_levels(linep);
@@ -7260,7 +7327,7 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
             }
         } else {
             if (linep->attrs.has_dirty_text || (cursor_has_moved && (self->cursor->y == lnum || self->last_rendered.cursor.y == lnum)) || relevel) {
-                render_line(fonts_data, linep, lnum, self->cursor, self->disable_ligatures, self->lc, levels);
+                render_line(fonts_data, linep, lnum, &render_cursor, self->disable_ligatures, self->lc, levels);
                 if (UNLIKELY(mapped)) bidi_store_levels(b, render_row, linep);
 #ifdef DEBUG
                 else if (b) bidi_check_unmapped_levels(linep);
@@ -7476,11 +7543,19 @@ apply_selection(Screen *self, uint8_t *data, size_t stride, Selection *s, uint8_
         XRange xr = xrange_for_iteration_with_multicells(&s->last_rendered, y, line);
         for (index_type x = xr.x; x < xr.x_limit; x++) {
             line_start[stride * x] |= set_mask;
-            CPUCell *c = &line->cpu_cells[x];
+            const CPUCell *c = &line->cpu_cells[x];
             if (c->is_multicell && c->scale > 1) {
-                for (int ym = MAX(0, y_in_data - c->y); ym < y_in_data; ym++) data[stride * (self->columns * ym + x)] |= set_mask;
-                for (int ym = y_in_data + 1; ym < MIN((int)self->lines + extra_leading_rows, y_in_data + c->scale - c->y); ym++)
-                    data[stride * (self->columns * ym + x)] |= set_mask;
+                // The rows of the char above and below, only those present, as it can be partial
+                for (int k = 1; k <= (int)c->y && y_in_data - k >= 0; k++) {
+                    const CPUCell *other = rendered_row_cells(self, y - k);
+                    if (!other || !continues_multicell_char(other + x, c, c->y - (index_type)k)) break;
+                    data[stride * (self->columns * (y_in_data - k) + x)] |= set_mask;
+                }
+                for (int k = 1; (int)c->y + k < (int)c->scale && y_in_data + k < (int)self->lines + extra_leading_rows; k++) {
+                    const CPUCell *other = rendered_row_cells(self, y + k);
+                    if (!other || !continues_multicell_char(other + x, c, c->y + (index_type)k)) break;
+                    data[stride * (self->columns * (y_in_data + k) + x)] |= set_mask;
+                }
             }
         }
     }
@@ -7689,12 +7764,59 @@ select_cell(SelectedCells *sc, int y, index_type x) {
 }
 
 static bool
+range_row_cells(Screen *self, int y, const CPUCell **cells) {
+    // The cells of range line y, see container_row_func. All rows of the
+    // screen and the scrollback are known, so that multiline chars crossing
+    // the edges of the lines being written are written as they are.
+    if (y >= (int)self->lines) {
+        *cells = NULL;
+        return true;
+    }
+    if (y >= 0) {
+        *cells = linebuf_cpu_cells_for_line(self->linebuf, y);
+        return true;
+    }
+    // The scrollback is above the main screen only
+    if (self->linebuf != self->main_linebuf) {
+        *cells = NULL;
+        return true;
+    }
+    return historybuf_row_cells(self->historybuf, -(int64_t)y - 1, cells);
+}
+
+// The rows around a range line being written as ANSI, see ANSILineState
+typedef struct RangeNeighbourRows {
+    Screen *screen;
+    int y;
+} RangeNeighbourRows;
+
+static bool
+range_neighbour_row(void *ctx, int dy, const CPUCell **cells) {
+    // Selections are of the screen and the scrollback, the rows above the
+    // scrollback, including the last line of the pager history, are not part of them
+    const RangeNeighbourRows *r = ctx;
+    *cells = scrollback_row_cells(r->screen, r->y + dy);
+    return true;
+}
+
+static bool
+continues_from_row_above(Screen *self, int y, index_type x, const CPUCell *c) {
+    // Whether the cell c, in column x of range line y, continues a multiline
+    // char from the row above, rather than being the top row of the part of
+    // the char present. Selections are of the screen and the scrollback, so
+    // the rows above the scrollback, including the last line of the pager
+    // history, do not continue it.
+    if (!c->is_multicell || !c->y) return false;
+    const CPUCell *above = scrollback_row_cells(self, y - 1);
+    return above && continues_multicell_char(above + x, c, c->y - 1u);
+}
+
+static bool
 flag_selection_to_extract_text(Screen *self, const Selection *s, int *miny, int *y_limit, SelectedCells *sc) {
     // Find the cells whose text is in the selection. Returns false on allocation failure.
     IterationData idata;
     bool has_history = self->linebuf == self->main_linebuf;
     iteration_data(s, &idata, self->columns, has_history ? -self->historybuf->count : 0, 0);
-    Line *line;
     *miny = idata.y;
     *y_limit = MIN(idata.y_limit, (int)self->lines);
     if (*miny >= *y_limit) return true;
@@ -7713,22 +7835,23 @@ flag_selection_to_extract_text(Screen *self, const Selection *s, int *miny, int 
         for (index_type x = xr.x; x < xr.x_limit; x++) {
             c = temp.cpu_cells + x;
             select_cell(sc, y, x);
-            if (c->is_multicell && c->y) {
-                for (int ym = y - c->y; ym < y; ym++) {
-                    line = checked_range_line(self, ym);
-                    if (line) {
-                        select_cell(sc, ym, x);
-                        *miny = MIN(*miny, ym);
-                    }
-                }
+            // The text of a multiline char is written in the top row of the
+            // part of it present, which can be partial, so select that row
+            const CPUCell *cur = c;
+            for (int ym = y; ym > sc->y_start && continues_from_row_above(self, ym, x, cur); ym--) {
+                select_cell(sc, ym - 1, x);
+                *miny = MIN(*miny, ym - 1);
+                // the cell of the char in the row above, which is present as it continues the char
+                cur = scrollback_row_cells(self, ym - 1) + x;
             }
         }
     }
-    // remove lines from bottom that contain only y > 0 cells from multicell
+    // remove lines from bottom that contain only cells of multiline chars continuing from the rows above, whose text is in those rows
     while (*y_limit > *miny) {
         range_line(self, *y_limit - 1, &temp);
         for (index_type x = 0; x < temp.xnum; x++) {
-            if (is_cell_selected(sc, *y_limit - 1, x) && temp.cpu_cells[x].ch_and_idx && (!temp.cpu_cells[x].is_multicell || !temp.cpu_cells[x].y)) return true;
+            const CPUCell *c = temp.cpu_cells + x;
+            if (is_cell_selected(sc, *y_limit - 1, x) && c->ch_and_idx && !continues_from_row_above(self, *y_limit - 1, x, c)) return true;
         }
         (*y_limit)--;
     }
@@ -7746,8 +7869,10 @@ text_for_range(Screen *self, const Selection *sel, bool insert_newlines, bool st
     RAII_PyObject(nl, PyUnicode_FromString("\n"));
     RAII_PyObject(empty, PyUnicode_FromString(""));
     if (!ans || !nl || !empty) return NULL;
+    RangeNeighbourRows neighbours = {.screen = self};
     for (int i = 0, y = min_y; y < y_limit; y++, i++) {
         Line *line = range_line_(self, y);
+        neighbours.y = y;
         index_type x_limit = line->xnum, x_start = 0;
         while (x_limit && !is_cell_selected(&sc, y, x_limit - 1)) x_limit--;
         while (x_start < x_limit && !is_cell_selected(&sc, y, x_start)) x_start++;
@@ -7773,7 +7898,9 @@ text_for_range(Screen *self, const Selection *sel, bool insert_newlines, bool st
             while (x_start < x_limit) {
                 index_type end = x_start;
                 while (end < x_limit && is_cell_selected(&sc, y, end)) end++;
-                if (!unicode_in_range(line, x_start, end, true, add_trailing_newline, false, !is_first_line, &self->as_ansi_buf)) return PyErr_NoMemory();
+                if (!unicode_in_range(
+                        line, x_start, end, true, add_trailing_newline, false, !is_first_line, range_neighbour_row, &neighbours, &self->as_ansi_buf))
+                    return PyErr_NoMemory();
                 x_start = MAX(x_start + 1, end);
             }
             text = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, self->as_ansi_buf.buf + before, self->as_ansi_buf.len - before);
@@ -7791,7 +7918,8 @@ ansi_for_range(Screen *self, const Selection *sel, bool insert_newlines, bool st
     RAII_SelectedCells(sc);
     if (!flag_selection_to_extract_text(self, sel, &min_y, &y_limit, &sc)) return PyErr_NoMemory();
     if (min_y >= y_limit) return PyTuple_New(0);
-    ANSILineState s = {.output_buf = &self->as_ansi_buf};
+    RangeNeighbourRows neighbours = {.screen = self};
+    ANSILineState s = {.output_buf = &self->as_ansi_buf, .neighbour_row = range_neighbour_row, .neighbour_row_ctx = &neighbours};
     s.output_buf->active_hyperlink_id = 0;
     s.output_buf->len = 0;
     RAII_PyObject(ans, PyTuple_New(y_limit - min_y + 1));
@@ -7805,6 +7933,7 @@ ansi_for_range(Screen *self, const Selection *sel, bool insert_newlines, bool st
         const bool is_first_line = y == min_y;
         s.output_buf->len = 0;
         Line *line = range_line_(self, y);
+        neighbours.y = y;
         ansi_bidi_row_start(&s, line);
         const bool bidi_continued = line->cpu_cells[line->xnum - 1].next_char_was_wrapped && y + 1 < y_limit;
         index_type x_limit = line->xnum, x_start = 0;
@@ -8210,7 +8339,8 @@ append_row_to_ime_text(Screen *self, index_type y, index_type start, index_type 
     limit = MIN(limit, trim_trailing ? xlimit_for_line(line) : line->xnum);
     start = MIN(start, line->xnum);
     if (start >= limit) return true;
-    return unicode_in_range(line, start, limit, true, false, false, true, buf);
+    RangeNeighbourRows neighbours = {.screen = self, .y = (int)y};
+    return unicode_in_range(line, start, limit, true, false, false, true, range_neighbour_row, &neighbours, buf);
 }
 
 bool
@@ -8496,7 +8626,9 @@ render_overlay_line(Screen *self, Line *line, FONTS_DATA_HANDLE fonts_data) {
         memset(b->row_levels, BIDI_LEVEL_FIXED, line->xnum);
         levels = b->row_levels;
     }
-    render_line(fonts_data, line, ol.ynum, self->cursor, self->disable_ligatures, self->lc, levels);
+    // The pre-edit text is on the row of the cursor, in chars that are one row high
+    const RenderCursor render_cursor = {.cursor = self->cursor, .char_top = ol.ynum, .char_limit = ol.ynum + 1};
+    render_line(fonts_data, line, ol.ynum, &render_cursor, self->disable_ligatures, self->lc, levels);
     line_save_cells(line, 0, line->xnum, ol.render_cells, ol.cpu_cells);
     line_reset_cells(line, 0, line->xnum, ol.original_line.render_cells, ol.original_line.cpu_cells);
     ol.is_dirty = false;
@@ -8618,6 +8750,40 @@ get_range_line(void *x, int y) {
     return range_line_(x, y);
 }
 
+static bool
+visual_row_cells(void *x, int y, const CPUCell **cells) {
+    Screen *self = x;
+    return range_row_cells(self, y - (int)self->scrolled_by, cells);
+}
+
+static bool
+range_row_cells_(void *x, int y, const CPUCell **cells) {
+    return range_row_cells(x, y, cells);
+}
+
+// The lines of the scrollback, from the oldest, as range lines, so that the
+// rows of the screen below the newest are known
+static Line *
+get_history_line(void *x, int y) {
+    Screen *self = x;
+    return range_line_(self, y - (int)self->historybuf->count);
+}
+
+static bool
+history_row_cells(void *x, int y, const CPUCell **cells) {
+    // The scrollback is above the main screen, whichever screen is active
+    Screen *self = x;
+    const int ry = y - (int)self->historybuf->count;
+    if (ry < 0) return historybuf_row_cells(self->historybuf, -(int64_t)ry - 1, cells);
+    *cells = ry < (int)self->lines ? linebuf_cpu_cells_for_line(self->main_linebuf, (index_type)ry) : NULL;
+    return true;
+}
+
+static uint8_t
+pagerhist_bidi_above(void *x) {
+    return historybuf_pagerhist_bidi_open(((Screen *)x)->historybuf);
+}
+
 static uint8_t
 visual_bidi_above(void *x) {
     Screen *self = x;
@@ -8631,22 +8797,22 @@ range_bidi_above(void *x) {
 
 static PyObject *
 as_text(Screen *self, PyObject *args) {
-    return as_text_generic(args, self, get_visual_line, self->lines, &self->as_ansi_buf, false, visual_bidi_above, false);
+    return as_text_generic(args, self, get_visual_line, visual_row_cells, self->lines, &self->as_ansi_buf, false, visual_bidi_above, false);
 }
 
 static PyObject *
 as_text_non_visual(Screen *self, PyObject *args) {
-    return as_text_generic(args, self, get_range_line, self->lines, &self->as_ansi_buf, false, range_bidi_above, false);
+    return as_text_generic(args, self, get_range_line, range_row_cells_, self->lines, &self->as_ansi_buf, false, range_bidi_above, false);
 }
 
 static PyObject *
 as_text_for_history_buf(Screen *self, PyObject *args) {
-    return as_text_history_buf(self->historybuf, args, &self->as_ansi_buf);
+    return as_text_generic(args, self, get_history_line, history_row_cells, self->historybuf->count, &self->as_ansi_buf, true, pagerhist_bidi_above, false);
 }
 
 static PyObject *
 as_text_generic_wrapper(Screen *self, PyObject *args, get_line_func get_line) {
-    return as_text_generic(args, self, get_line, self->lines, &self->as_ansi_buf, false, range_bidi_above, false);
+    return as_text_generic(args, self, get_line, range_row_cells_, self->lines, &self->as_ansi_buf, false, range_bidi_above, false);
 }
 
 static PyObject *
@@ -8669,6 +8835,12 @@ static Line *
 get_line_from_offset(void *x, int y) {
     OutputOffset *r = x;
     return range_line_(r->screen, r->start + y);
+}
+
+static bool
+offset_row_cells(void *x, int y, const CPUCell **cells) {
+    OutputOffset *r = x;
+    return range_row_cells(r->screen, r->start + y, cells);
 }
 
 static uint8_t
@@ -8944,7 +9116,9 @@ cmd_output(Screen *self, PyObject *args) {
     const bool after_pagerhist = oo.reached_upper_limit && self->linebuf == self->main_linebuf && OPT(scrollback_pager_history_size) > 0;
     if (found) {
         RAII_PyObject(
-            ret, as_text_generic(as_text_args, &oo, get_line_from_offset, oo.num_lines, &self->as_ansi_buf, false, offset_bidi_above, after_pagerhist));
+            ret,
+            as_text_generic(
+                as_text_args, &oo, get_line_from_offset, offset_row_cells, oo.num_lines, &self->as_ansi_buf, false, offset_bidi_above, after_pagerhist));
         if (!ret) return NULL;
     }
     if (after_pagerhist) Py_RETURN_TRUE;
@@ -11088,6 +11262,18 @@ test_cursor_x(Screen *self, PyObject *args) {
 }
 
 static PyObject *
+test_large_cursor_extent(Screen *self, PyObject *args) {
+    // The (rows, columns) covered by a cursor at (x, y), None when it is not large
+    unsigned int x, y;
+    if (!PyArg_ParseTuple(args, "II", &x, &y)) return NULL;
+    Line overlay_line = {0};
+    Line *line = screen_line_for_cursor(self, x, y, &overlay_line);
+    index_type rows, cols;
+    if (!line || !screen_large_cursor_extent(self, line, x, y, &rows, &cols)) Py_RETURN_NONE;
+    return Py_BuildValue("II", rows, cols);
+}
+
+static PyObject *
 test_ch_and_idx(PyObject *self UNUSED, PyObject *val) {
     CPUCell c = {0};
     if (PyLong_Check(val)) {
@@ -11123,6 +11309,7 @@ static PyMethodDef methods[] = {
     METHODB(test_bidi_logical_click, METH_VARARGS),
     METHODB(test_hyperlink_under_mouse, METH_NOARGS),
     METHODB(test_cursor_x, METH_VARARGS),
+    METHODB(test_large_cursor_extent, METH_VARARGS),
     METHODB(test_gc_style_table, METH_VARARGS),
     METHODB(test_draw_overlay_line, METH_VARARGS),
     METHODB(test_update_overlay_text, METH_VARARGS),
